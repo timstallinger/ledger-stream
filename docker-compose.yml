@@ -47,13 +47,13 @@ services:
       KAFKA_LOG_DIRS: "/var/lib/kafka/data"
       KAFKA_LOG_CLEANER_DEDUPE_BUFFER_SIZE: "16777216"
       KAFKA_LOG_CLEANER_IO_BUFFER_SIZE: "524288"
-      KAFKA_HEAP_OPTS: "-Xms160m -Xmx224m"
+      KAFKA_HEAP_OPTS: "-Xms128m -Xmx192m"
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
     ports:
       - "${KAFKA_PORT:-9092}:9092"
     volumes:
       - kafka_data:/var/lib/kafka/data
-    mem_limit: 352m
+    mem_limit: 448m
     cpus: 0.35
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/29092'"]

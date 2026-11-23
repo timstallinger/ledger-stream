@@ -26,3 +26,20 @@ jobs:
 
       - name: Build and run unit, ArchUnit and Testcontainers tests
         run: ./mvnw -B verify
+
+      - name: Verify Failsafe integration tests actually executed
+        run: |
+          SUMMARY="app/target/failsafe-reports/failsafe-summary.xml"
+          if [ ! -f "$SUMMARY" ]; then
+            echo "ERROR: Missing $SUMMARY — integration tests did not run!"
+            exit 1
+          fi
+          cat "$SUMMARY"
+          COMPLETED=$(sed -n 's/.*<completed>\([0-9]*\)<\/completed>.*/\1/p' "$SUMMARY")
+          ERRORS=$(sed -n 's/.*<errors>\([0-9]*\)<\/errors>.*/\1/p' "$SUMMARY")
+          FAILURES=$(sed -n 's/.*<failures>\([0-9]*\)<\/failures>.*/\1/p' "$SUMMARY")
+          echo "Failsafe ITs: completed=${COMPLETED}, errors=${ERRORS}, failures=${FAILURES}"
+          if [ -z "$COMPLETED" ] || [ "$COMPLETED" -lt 1 ]; then
+            echo "ERROR: Expected at least 1 integration test to execute."
+            exit 1
+          fi
