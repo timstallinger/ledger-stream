@@ -9,6 +9,10 @@ import io.ledgerstream.application.port.out.AccountRepository;
 import io.ledgerstream.application.port.out.BookingRepository;
 import io.ledgerstream.application.port.out.DuplicateIdempotencyKeyException;
 import io.ledgerstream.application.port.out.IdempotencyStore;
+import io.ledgerstream.application.port.out.OutboxEvent;
+import io.ledgerstream.application.port.out.OutboxPayloadSerializer;
+import io.ledgerstream.application.port.out.OutboxRepository;
+import io.ledgerstream.application.port.out.OutboxStatus;
 import io.ledgerstream.application.port.out.TransactionRunner;
 import io.ledgerstream.domain.exception.InsufficientBalanceException;
 import io.ledgerstream.domain.exception.OptimisticLockConflictException;
@@ -35,6 +39,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
@@ -49,6 +54,8 @@ final class BookingServiceTest {
     private InMemoryAccountRepository accountRepository;
     private InMemoryBookingRepository bookingRepository;
     private InMemoryIdempotencyStore idempotencyStore;
+    private InMemoryOutboxRepository outboxRepository;
+    private OutboxPayloadSerializer payloadSerializer;
     private AccountService accountService;
     private BookingService bookingService;
 
@@ -57,6 +64,8 @@ final class BookingServiceTest {
         accountRepository = new InMemoryAccountRepository();
         bookingRepository = new InMemoryBookingRepository();
         idempotencyStore = new InMemoryIdempotencyStore();
+        outboxRepository = new InMemoryOutboxRepository();
+        payloadSerializer = event -> "{\"eventId\":\"" + event.eventId() + "\",\"eventType\":\"" + event.eventType() + "\"}";
         TransactionRunner directTransactionRunner = new TransactionRunner() {
             @Override
             public <T> T executeInTransaction(final Supplier<T> action) {
@@ -68,13 +77,15 @@ final class BookingServiceTest {
                 accountRepository,
                 bookingRepository,
                 idempotencyStore,
+                outboxRepository,
+                payloadSerializer,
                 directTransactionRunner,
                 FIXED_CLOCK
         );
     }
 
     @Test
-    void returnsByteIdenticalCachedResponseOnDuplicateIdempotencyKeyWithoutSecondEffect() {
+    void returnsByteIdenticalCachedResponseOnDuplicateIdempotencyKeyWithoutSecondEffectOrSecondOutboxEvent() {
         Account account = accountService.execute(new CreateAccountCommand(AccountNumber.of("DE-2001"), EUR));
         CreateBookingCommand command = new CreateBookingCommand(
                 account.id(),
@@ -99,10 +110,12 @@ final class BookingServiceTest {
         assertThat(accountRepository.findById(account.id()).orElseThrow().balance())
                 .isEqualTo(Money.of(new BigDecimal("100.00"), EUR));
         assertThat(bookingRepository.findByAccountId(account.id())).hasSize(1);
+        assertThat(outboxRepository.savedEvents).hasSize(1);
+        assertThat(outboxRepository.savedEvents.getFirst().status()).isEqualTo(OutboxStatus.PENDING);
     }
 
     @Test
-    void doesNotCacheRejectedRequestsSoRetryingAfterFundingSucceeds() {
+    void doesNotCacheRejectedRequestsOrWriteOutboxEventSoRetryingAfterFundingSucceeds() {
         Account account = accountService.execute(new CreateAccountCommand(AccountNumber.of("DE-2002"), EUR));
         IdempotencyKey key = IdempotencyKey.of("idem-retry-after-fail");
         CreateBookingCommand debit = new CreateBookingCommand(
@@ -119,6 +132,7 @@ final class BookingServiceTest {
         )).isInstanceOf(InsufficientBalanceException.class);
 
         assertThat(idempotencyStore.find(account.id(), key)).isEmpty();
+        assertThat(outboxRepository.savedEvents).isEmpty();
 
         bookingService.execute(
                 new CreateBookingCommand(
@@ -140,6 +154,7 @@ final class BookingServiceTest {
         assertThat(retry.response().responseBody()).isEqualTo("{\"debited\":true}");
         assertThat(accountRepository.findById(account.id()).orElseThrow().balance())
                 .isEqualTo(Money.of(new BigDecimal("30.00"), EUR));
+        assertThat(outboxRepository.savedEvents).hasSize(2);
     }
 
     @Test
@@ -174,6 +189,8 @@ final class BookingServiceTest {
                 accountRepository,
                 bookingRepository,
                 racingStore,
+                outboxRepository,
+                payloadSerializer,
                 new TransactionRunner() {
                     @Override
                     public <T> T executeInTransaction(final Supplier<T> action) {
@@ -199,7 +216,7 @@ final class BookingServiceTest {
     }
 
     @Test
-    void cancellationCreatesCounterBookingAndChecksNonNegativeBalance() {
+    void cancellationCreatesCounterBookingAndWritesBookingCancelledOutboxEvent() {
         Account account = accountService.execute(new CreateAccountCommand(AccountNumber.of("DE-2004"), EUR));
         final BookingId[] createdId = new BookingId[1];
 
@@ -236,6 +253,9 @@ final class BookingServiceTest {
                 .anyMatch(b -> createdId[0].equals(b.originalBookingId())
                         && b.type() == BookingType.DEBIT
                         && b.status() == BookingStatus.POSTED);
+        assertThat(outboxRepository.savedEvents)
+                .extracting(OutboxEvent::eventType)
+                .containsExactly("BookingCreated", "BookingCancelled");
     }
 
     private static final class InMemoryAccountRepository implements AccountRepository {
@@ -330,6 +350,38 @@ final class BookingServiceTest {
                 throw new DuplicateIdempotencyKeyException(accountId, key);
             }
             store.put(composite, response);
+        }
+    }
+
+    private static final class InMemoryOutboxRepository implements OutboxRepository {
+        private final List<OutboxEvent> savedEvents = new ArrayList<>();
+
+        @Override
+        public void save(final OutboxEvent event) {
+            savedEvents.add(event);
+        }
+
+        @Override
+        public List<UUID> findPendingIds(final int limit) {
+            return savedEvents.stream().map(OutboxEvent::id).limit(limit).toList();
+        }
+
+        @Override
+        public Optional<OutboxEvent> lockPendingById(final UUID eventId) {
+            return savedEvents.stream().filter(e -> e.id().equals(eventId)).findFirst();
+        }
+
+        @Override
+        public void markSent(final UUID eventId, final Instant sentAt) {
+        }
+
+        @Override
+        public void recordFailure(final UUID eventId, final String errorMessage) {
+        }
+
+        @Override
+        public long countPending() {
+            return savedEvents.size();
         }
     }
 }
