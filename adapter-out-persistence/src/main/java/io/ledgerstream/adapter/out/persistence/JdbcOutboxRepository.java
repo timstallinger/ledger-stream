@@ -3,6 +3,7 @@ package io.ledgerstream.adapter.out.persistence;
 import io.ledgerstream.application.port.out.OutboxEvent;
 import io.ledgerstream.application.port.out.OutboxRepository;
 import io.ledgerstream.application.port.out.OutboxStatus;
+import io.ledgerstream.application.port.out.PendingOutboxCandidate;
 import org.springframework.jdbc.core.simple.JdbcClient;
 
 import java.sql.ResultSet;
@@ -29,12 +30,12 @@ public final class JdbcOutboxRepository implements OutboxRepository {
                         INSERT INTO outbox_events (
                             id, aggregate_type, aggregate_id, event_type, schema_version,
                             payload, correlation_id, status, occurred_at, created_at,
-                            sent_at, retry_count, last_error
+                            sent_at, retry_count, last_error, next_attempt_at
                         )
                         VALUES (
                             :id, :aggregateType, :aggregateId, :eventType, :schemaVersion,
                             :payload, :correlationId, :status, :occurredAt, :createdAt,
-                            :sentAt, :retryCount, :lastError
+                            :sentAt, :retryCount, :lastError, :nextAttemptAt
                         )
                         """)
                 .param("id", event.id())
@@ -50,35 +51,52 @@ public final class JdbcOutboxRepository implements OutboxRepository {
                 .param("sentAt", event.sentAt() != null ? OffsetDateTime.ofInstant(event.sentAt(), ZoneOffset.UTC) : null)
                 .param("retryCount", event.retryCount())
                 .param("lastError", event.lastError())
+                .param("nextAttemptAt", OffsetDateTime.ofInstant(event.nextAttemptAt(), ZoneOffset.UTC))
                 .update();
     }
 
     @Override
-    public List<UUID> findPendingIds(final int limit) {
+    public List<PendingOutboxCandidate> findPendingCandidates(final int limit, final Instant now) {
+        OffsetDateTime nowUtc = OffsetDateTime.ofInstant(now, ZoneOffset.UTC);
         return jdbcClient.sql("""
-                        SELECT id
-                        FROM outbox_events
-                        WHERE status = 'PENDING'
-                        ORDER BY created_at ASC
+                        SELECT e.id, e.aggregate_id
+                        FROM outbox_events e
+                        WHERE e.status = 'PENDING'
+                          AND e.next_attempt_at <= :now
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM outbox_events earlier
+                              WHERE earlier.aggregate_id = e.aggregate_id
+                                AND earlier.status = 'PENDING'
+                                AND earlier.created_at < e.created_at
+                                AND earlier.next_attempt_at > :now
+                          )
+                        ORDER BY e.created_at ASC
                         LIMIT :limit
                         """)
+                .param("now", nowUtc)
                 .param("limit", limit)
-                .query(UUID.class)
+                .query((rs, rowNum) -> new PendingOutboxCandidate(
+                        rs.getObject("id", UUID.class),
+                        rs.getObject("aggregate_id", UUID.class)
+                ))
                 .list();
     }
 
     @Override
-    public Optional<OutboxEvent> lockPendingById(final UUID eventId) {
+    public Optional<OutboxEvent> lockPendingById(final UUID eventId, final Instant now) {
         return jdbcClient.sql("""
                         SELECT id, aggregate_type, aggregate_id, event_type, schema_version,
                                payload, correlation_id, status, occurred_at, created_at,
-                               sent_at, retry_count, last_error
+                               sent_at, retry_count, last_error, next_attempt_at
                         FROM outbox_events
                         WHERE id = :id
                           AND status = 'PENDING'
+                          AND next_attempt_at <= :now
                         FOR UPDATE SKIP LOCKED
                         """)
                 .param("id", eventId)
+                .param("now", OffsetDateTime.ofInstant(now, ZoneOffset.UTC))
                 .query(this::mapOutboxEvent)
                 .optional();
     }
@@ -98,16 +116,27 @@ public final class JdbcOutboxRepository implements OutboxRepository {
     }
 
     @Override
-    public void recordFailure(final UUID eventId, final String errorMessage) {
-        jdbcClient.sql("""
+    public int recordRetryFailure(
+            final UUID eventId,
+            final String errorMessage,
+            final Instant nextAttemptAt,
+            final int maxAttempts
+    ) {
+        return jdbcClient.sql("""
                         UPDATE outbox_events
                         SET retry_count = retry_count + 1,
-                            last_error = :lastError
+                            last_error = :lastError,
+                            next_attempt_at = :nextAttemptAt,
+                            status = CASE WHEN retry_count + 1 >= :maxAttempts THEN 'FAILED' ELSE 'PENDING' END
                         WHERE id = :id
+                        RETURNING retry_count
                         """)
                 .param("lastError", errorMessage)
+                .param("nextAttemptAt", OffsetDateTime.ofInstant(nextAttemptAt, ZoneOffset.UTC))
+                .param("maxAttempts", maxAttempts)
                 .param("id", eventId)
-                .update();
+                .query(Integer.class)
+                .single();
     }
 
     @Override
@@ -115,6 +144,15 @@ public final class JdbcOutboxRepository implements OutboxRepository {
         return jdbcClient.sql("SELECT COUNT(*) FROM outbox_events WHERE status = 'PENDING'")
                 .query(Long.class)
                 .single();
+    }
+
+    @Override
+    public Optional<Instant> findOldestPendingCreatedAt() {
+        OffsetDateTime oldest = jdbcClient.sql("SELECT MIN(created_at) FROM outbox_events WHERE status = 'PENDING'")
+                .query(OffsetDateTime.class)
+                .optional()
+                .orElse(null);
+        return Optional.ofNullable(oldest).map(OffsetDateTime::toInstant);
     }
 
     private OutboxEvent mapOutboxEvent(final ResultSet rs, final int rowNum) throws SQLException {
@@ -132,7 +170,8 @@ public final class JdbcOutboxRepository implements OutboxRepository {
                 rs.getObject("created_at", OffsetDateTime.class).toInstant(),
                 sentAt != null ? sentAt.toInstant() : null,
                 rs.getInt("retry_count"),
-                rs.getString("last_error")
+                rs.getString("last_error"),
+                rs.getObject("next_attempt_at", OffsetDateTime.class).toInstant()
         );
     }
 }

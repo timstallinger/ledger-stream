@@ -9,6 +9,7 @@ import io.ledgerstream.domain.model.AccountId;
 import io.ledgerstream.domain.model.AccountNumber;
 import io.ledgerstream.domain.model.CurrencyCode;
 import io.ledgerstream.domain.model.Money;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 
@@ -95,6 +96,9 @@ public final class JdbcAccountRepository implements AccountRepository {
             )) {
                 throw new InsufficientBalanceException(account.id());
             }
+            throw exception;
+        } catch (DataAccessException exception) {
+            PostgresErrorTranslator.rethrowIfLockTimeout(exception, "account update");
             throw exception;
         }
     }

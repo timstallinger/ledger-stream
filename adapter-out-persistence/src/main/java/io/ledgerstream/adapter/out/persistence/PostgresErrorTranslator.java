@@ -1,7 +1,9 @@
 package io.ledgerstream.adapter.out.persistence;
 
+import io.ledgerstream.domain.exception.LockTimeoutException;
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.ServerErrorMessage;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 
 import java.sql.SQLException;
@@ -10,6 +12,7 @@ final class PostgresErrorTranslator {
 
     static final String SQL_STATE_UNIQUE_VIOLATION = "23505";
     static final String SQL_STATE_CHECK_VIOLATION = "23514";
+    static final String SQL_STATE_LOCK_NOT_AVAILABLE = "55P03";
 
     private PostgresErrorTranslator() {
     }
@@ -35,5 +38,16 @@ final class PostgresErrorTranslator {
             current = current.getCause();
         }
         return false;
+    }
+
+    static void rethrowIfLockTimeout(final DataAccessException exception, final String context) {
+        Throwable current = exception;
+        while (current != null) {
+            if (current instanceof SQLException sqlException
+                    && SQL_STATE_LOCK_NOT_AVAILABLE.equals(sqlException.getSQLState())) {
+                throw new LockTimeoutException("Database lock timeout exceeded during " + context);
+            }
+            current = current.getCause();
+        }
     }
 }

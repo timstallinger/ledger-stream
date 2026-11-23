@@ -13,6 +13,7 @@ import io.ledgerstream.application.port.out.OutboxEvent;
 import io.ledgerstream.application.port.out.OutboxPayloadSerializer;
 import io.ledgerstream.application.port.out.OutboxRepository;
 import io.ledgerstream.application.port.out.OutboxStatus;
+import io.ledgerstream.application.port.out.PendingOutboxCandidate;
 import io.ledgerstream.application.port.out.TransactionRunner;
 import io.ledgerstream.domain.exception.InsufficientBalanceException;
 import io.ledgerstream.domain.exception.OptimisticLockConflictException;
@@ -362,12 +363,15 @@ final class BookingServiceTest {
         }
 
         @Override
-        public List<UUID> findPendingIds(final int limit) {
-            return savedEvents.stream().map(OutboxEvent::id).limit(limit).toList();
+        public List<PendingOutboxCandidate> findPendingCandidates(final int limit, final Instant now) {
+            return savedEvents.stream()
+                    .map(e -> new PendingOutboxCandidate(e.id(), e.aggregateId()))
+                    .limit(limit)
+                    .toList();
         }
 
         @Override
-        public Optional<OutboxEvent> lockPendingById(final UUID eventId) {
+        public Optional<OutboxEvent> lockPendingById(final UUID eventId, final Instant now) {
             return savedEvents.stream().filter(e -> e.id().equals(eventId)).findFirst();
         }
 
@@ -376,12 +380,23 @@ final class BookingServiceTest {
         }
 
         @Override
-        public void recordFailure(final UUID eventId, final String errorMessage) {
+        public int recordRetryFailure(
+                final UUID eventId,
+                final String errorMessage,
+                final Instant nextAttemptAt,
+                final int maxAttempts
+        ) {
+            return 1;
         }
 
         @Override
         public long countPending() {
             return savedEvents.size();
+        }
+
+        @Override
+        public Optional<Instant> findOldestPendingCreatedAt() {
+            return savedEvents.stream().map(OutboxEvent::createdAt).min(Instant::compareTo);
         }
     }
 }

@@ -5,10 +5,13 @@ import io.ledgerstream.domain.exception.AccountNotFoundException;
 import io.ledgerstream.domain.exception.BookingNotFoundException;
 import io.ledgerstream.domain.exception.DuplicateAccountNumberException;
 import io.ledgerstream.domain.exception.InvalidDomainValueException;
+import io.ledgerstream.domain.exception.LockTimeoutException;
 import io.ledgerstream.domain.exception.OptimisticLockConflictException;
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -49,6 +52,23 @@ public final class ProblemDetailExceptionHandler {
             final HttpServletRequest request
     ) {
         return buildProblem(HttpStatus.CONFLICT, "Conflict", exception.errorCode(), exception.getMessage(), request);
+    }
+
+    @ExceptionHandler(LockTimeoutException.class)
+    public ResponseEntity<ProblemDetail> handleLockTimeout(
+            final LockTimeoutException exception,
+            final HttpServletRequest request
+    ) {
+        ProblemDetail problem = buildProblem(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "Service temporarily unavailable",
+                exception.errorCode(),
+                exception.getMessage(),
+                request
+        );
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "1")
+                .body(problem);
     }
 
     @ExceptionHandler(DomainException.class)

@@ -40,10 +40,14 @@ public final class KafkaOutboxEventPublisher implements OutboxEventPublisher {
     @Override
     public void publish(final OutboxEvent event) {
         Objects.requireNonNull(event, "event must not be null");
+        String accountPartitionKey = Objects.requireNonNull(
+                event.aggregateId(),
+                "aggregateId (accountId) must not be null for partition ordering"
+        ).toString();
         LedgerBookingEvent avroEvent = toAvroRecord(event);
         ProducerRecord<String, LedgerBookingEvent> record = new ProducerRecord<>(
                 topicProperties.ledgerEvents(),
-                event.aggregateId().toString(),
+                accountPartitionKey,
                 avroEvent
         );
         addHeader(record, "eventId", event.id().toString());

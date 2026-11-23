@@ -19,7 +19,8 @@ public record OutboxEvent(
         Instant createdAt,
         Instant sentAt,
         int retryCount,
-        String lastError
+        String lastError,
+        Instant nextAttemptAt
 ) {
 
     public static final String AGGREGATE_TYPE_ACCOUNT = "Account";
@@ -33,6 +34,7 @@ public record OutboxEvent(
         Objects.requireNonNull(status, "status must not be null");
         Objects.requireNonNull(occurredAt, "occurredAt must not be null");
         Objects.requireNonNull(createdAt, "createdAt must not be null");
+        Objects.requireNonNull(nextAttemptAt, "nextAttemptAt must not be null");
     }
 
     public static OutboxEvent pending(
@@ -55,7 +57,8 @@ public record OutboxEvent(
                 createdAt,
                 null,
                 0,
-                null
+                null,
+                createdAt
         );
     }
 }

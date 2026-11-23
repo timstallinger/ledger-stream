@@ -10,15 +10,19 @@ import io.ledgerstream.application.port.in.CreateBookingUseCase;
 import io.ledgerstream.application.port.in.RelayOutboxUseCase;
 import io.ledgerstream.application.port.out.OutboxEvent;
 import io.ledgerstream.application.port.out.OutboxEventPublisher;
+import io.ledgerstream.application.port.out.OutboxRelayObserver;
 import io.ledgerstream.application.port.out.OutboxRepository;
+import io.ledgerstream.application.port.out.PendingOutboxCandidate;
 import io.ledgerstream.application.port.out.TransactionRunner;
 import io.ledgerstream.application.service.OutboxRelayService;
+import io.ledgerstream.application.service.OutboxRetryBackoff;
 import io.ledgerstream.domain.model.AccountId;
 import io.ledgerstream.domain.model.BookingType;
 import io.ledgerstream.domain.model.CurrencyCode;
 import io.ledgerstream.domain.model.IdempotencyKey;
 import io.ledgerstream.domain.model.Money;
 import io.ledgerstream.domain.model.Reference;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -55,6 +59,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -134,6 +139,9 @@ final class TransactionalOutboxIT {
     private OutboxEventPublisher outboxEventPublisher;
 
     @Autowired
+    private OutboxRelayObserver outboxRelayObserver;
+
+    @Autowired
     private TransactionRunner transactionRunner;
 
     @Autowired
@@ -183,6 +191,7 @@ final class TransactionalOutboxIT {
         assertThat(outboxCount).isZero();
         assertThat(bookingCount).isZero();
         assertThat(outboxUnsentGauge()).isEqualTo(0.0);
+        assertThat(outboxOldestPendingAgeGauge()).isEqualTo(0.0);
     }
 
     @Test
@@ -202,10 +211,13 @@ final class TransactionalOutboxIT {
                 .single();
         assertThat(statusBeforeRelay).isEqualTo("PENDING");
         assertThat(outboxUnsentGauge()).isEqualTo(1.0);
+        assertThat(outboxOldestPendingAgeGauge()).isGreaterThanOrEqualTo(0.0);
 
         ResponseEntity<String> prometheus = restTemplate.getForEntity("/actuator/prometheus", String.class);
         assertThat(prometheus.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(prometheus.getBody()).contains("outbox_unsent 1.0");
+        assertThat(prometheus.getBody()).contains("outbox_oldest_pending_age_seconds");
+        assertThat(prometheus.getBody()).contains("outbox_events_failed_total");
 
         int relayed = relayOutboxUseCase.relayPendingBatch();
         assertThat(relayed).isEqualTo(1);
@@ -217,6 +229,7 @@ final class TransactionalOutboxIT {
                 .single();
         assertThat(statusAfterRelay).isEqualTo("SENT");
         assertThat(outboxUnsentGauge()).isEqualTo(0.0);
+        assertThat(outboxOldestPendingAgeGauge()).isEqualTo(0.0);
 
         List<ConsumerRecord<String, LedgerBookingEvent>> records =
                 consumeRecordsForAggregate(accountId, 1, Duration.ofSeconds(15));
@@ -255,13 +268,13 @@ final class TransactionalOutboxIT {
             }
 
             @Override
-            public List<UUID> findPendingIds(final int limit) {
-                return outboxRepository.findPendingIds(limit);
+            public List<PendingOutboxCandidate> findPendingCandidates(final int limit, final Instant now) {
+                return outboxRepository.findPendingCandidates(limit, now);
             }
 
             @Override
-            public Optional<OutboxEvent> lockPendingById(final UUID eventId) {
-                return outboxRepository.lockPendingById(eventId);
+            public Optional<OutboxEvent> lockPendingById(final UUID eventId, final Instant now) {
+                return outboxRepository.lockPendingById(eventId, now);
             }
 
             @Override
@@ -273,22 +286,35 @@ final class TransactionalOutboxIT {
             }
 
             @Override
-            public void recordFailure(final UUID eventId, final String errorMessage) {
-                outboxRepository.recordFailure(eventId, errorMessage);
+            public int recordRetryFailure(
+                    final UUID eventId,
+                    final String errorMessage,
+                    final Instant nextAttemptAt,
+                    final int maxAttempts
+            ) {
+                return outboxRepository.recordRetryFailure(eventId, errorMessage, nextAttemptAt, maxAttempts);
             }
 
             @Override
             public long countPending() {
                 return outboxRepository.countPending();
             }
+
+            @Override
+            public Optional<Instant> findOldestPendingCreatedAt() {
+                return outboxRepository.findOldestPendingCreatedAt();
+            }
         };
 
         OutboxRelayService faultInjectedRelay = new OutboxRelayService(
                 markSentFaultRepository,
                 outboxEventPublisher,
+                outboxRelayObserver,
                 transactionRunner,
                 clock,
-                500
+                new OutboxRetryBackoff(() -> 0.5),
+                500,
+                10
         );
 
         int firstAttemptRelayed = faultInjectedRelay.relayPendingBatch();
@@ -308,7 +334,22 @@ final class TransactionalOutboxIT {
         assertThat(statusAfterFailure).isEqualTo("PENDING");
         assertThat(retryCount).isEqualTo(1);
 
-        int secondAttemptRelayed = faultInjectedRelay.relayPendingBatch();
+        // Immediately retrying before next_attempt_at must be throttled by backoff
+        assertThat(faultInjectedRelay.relayPendingBatch()).isZero();
+
+        // Advance time past backoff window cleanly via clock for the second attempt
+        OutboxRelayService afterBackoffRelay = new OutboxRelayService(
+                markSentFaultRepository,
+                outboxEventPublisher,
+                outboxRelayObserver,
+                transactionRunner,
+                Clock.fixed(clock.instant().plusSeconds(5), ZoneOffset.UTC),
+                new OutboxRetryBackoff(() -> 0.5),
+                500,
+                10
+        );
+
+        int secondAttemptRelayed = afterBackoffRelay.relayPendingBatch();
         assertThat(secondAttemptRelayed).isEqualTo(1);
         assertThat(outboxUnsentGauge()).isEqualTo(0.0);
 
@@ -332,6 +373,78 @@ final class TransactionalOutboxIT {
 
         assertThat(projectedBalance).isEqualByComparingTo("50.00");
         assertThat(duplicatesRejected).isEqualTo(1);
+    }
+
+    @Test
+    void enforcesRetryLimitOfTenTransitionsToFailedAndPreservesPerAccountOrder() throws Exception {
+        Integer partialIndexExists = jdbcClient.sql("""
+                        SELECT COUNT(*)
+                        FROM pg_indexes
+                        WHERE schemaname = 'public'
+                          AND tablename = 'outbox_events'
+                          AND indexname = 'idx_outbox_events_pending_next_attempt'
+                          AND indexdef LIKE '%WHERE ((status)::text = ''PENDING''::text)%'
+                        """)
+                .query(Integer.class)
+                .single();
+        assertThat(partialIndexExists).isEqualTo(1);
+
+        String lockTimeout = jdbcClient.sql("SHOW lock_timeout").query(String.class).single();
+        assertThat(lockTimeout).isEqualTo("3s");
+
+        String accountA = createAccount("DE-HOL-A-" + UUID.randomUUID().toString().substring(0, 5));
+        String accountB = createAccount("DE-HOL-B-" + UUID.randomUUID().toString().substring(0, 5));
+
+        postBooking(accountA, "CREDIT", "10.00", "EUR", "A1", "idem-hol-a1");
+        postBooking(accountA, "CREDIT", "20.00", "EUR", "A2", "idem-hol-a2");
+        postBooking(accountB, "CREDIT", "30.00", "EUR", "B1", "idem-hol-b1");
+
+        double failedBefore = outboxFailedCounter();
+        OutboxEventPublisher failAccountAOnly = event -> {
+            if (event.aggregateId().toString().equals(accountA)) {
+                throw new IllegalStateException("Persistent publish failure for account A");
+            }
+            outboxEventPublisher.publish(event);
+        };
+
+        Instant simulatedNow = clock.instant().plusSeconds(1);
+        for (int attempt = 1; attempt <= 10; attempt++) {
+            OutboxRelayService relay = new OutboxRelayService(
+                    outboxRepository,
+                    failAccountAOnly,
+                    outboxRelayObserver,
+                    transactionRunner,
+                    Clock.fixed(simulatedNow, ZoneOffset.UTC),
+                    new OutboxRetryBackoff(() -> 0.5),
+                    500,
+                    10
+            );
+            int sent = relay.relayPendingBatch();
+            if (attempt == 1) {
+                // Account B succeeds immediately; Account A event 2 must NOT overtake Account A event 1
+                assertThat(sent).isEqualTo(1);
+            } else {
+                assertThat(sent).isZero();
+            }
+            simulatedNow = simulatedNow.plusSeconds(120);
+        }
+
+        List<String> statusesForA = jdbcClient.sql("""
+                        SELECT status FROM outbox_events
+                        WHERE aggregate_id = :id
+                        ORDER BY created_at ASC
+                        """)
+                .param("id", UUID.fromString(accountA))
+                .query(String.class)
+                .list();
+        assertThat(statusesForA).containsExactly("FAILED", "PENDING");
+        assertThat(outboxFailedCounter()).isEqualTo(failedBefore + 1.0);
+
+        String statusForB = jdbcClient.sql("SELECT status FROM outbox_events WHERE aggregate_id = :id")
+                .param("id", UUID.fromString(accountB))
+                .query(String.class)
+                .single();
+        assertThat(statusForB).isEqualTo("SENT");
     }
 
     @Test
@@ -369,6 +482,18 @@ final class TransactionalOutboxIT {
         Gauge gauge = meterRegistry.find("outbox_unsent_total").gauge();
         assertThat(gauge).isNotNull();
         return gauge.value();
+    }
+
+    private double outboxOldestPendingAgeGauge() {
+        Gauge gauge = meterRegistry.find("outbox_oldest_pending_age_seconds").gauge();
+        assertThat(gauge).isNotNull();
+        return gauge.value();
+    }
+
+    private double outboxFailedCounter() {
+        Counter counter = meterRegistry.find("outbox_events_failed_total").counter();
+        assertThat(counter).isNotNull();
+        return counter.count();
     }
 
     private List<ConsumerRecord<String, LedgerBookingEvent>> consumeRecordsForAggregate(

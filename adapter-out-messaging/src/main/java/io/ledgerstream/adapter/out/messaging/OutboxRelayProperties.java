@@ -7,7 +7,8 @@ public record OutboxRelayProperties(
         boolean enabled,
         int batchSize,
         long fixedDelayMs,
-        long publishTimeoutMs
+        long publishTimeoutMs,
+        int maxAttempts
 ) {
 
     public OutboxRelayProperties {
@@ -19,6 +20,9 @@ public record OutboxRelayProperties(
         }
         if (publishTimeoutMs <= 0) {
             throw new IllegalArgumentException("ledger.outbox.relay.publish-timeout-ms must be positive");
+        }
+        if (maxAttempts <= 0) {
+            throw new IllegalArgumentException("ledger.outbox.relay.max-attempts must be positive");
         }
     }
 }

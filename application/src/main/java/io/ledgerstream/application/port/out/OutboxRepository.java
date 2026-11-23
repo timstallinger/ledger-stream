@@ -9,13 +9,15 @@ public interface OutboxRepository {
 
     void save(OutboxEvent event);
 
-    List<UUID> findPendingIds(int limit);
+    List<PendingOutboxCandidate> findPendingCandidates(int limit, Instant now);
 
-    Optional<OutboxEvent> lockPendingById(UUID eventId);
+    Optional<OutboxEvent> lockPendingById(UUID eventId, Instant now);
 
     void markSent(UUID eventId, Instant sentAt);
 
-    void recordFailure(UUID eventId, String errorMessage);
+    int recordRetryFailure(UUID eventId, String errorMessage, Instant nextAttemptAt, int maxAttempts);
 
     long countPending();
+
+    Optional<Instant> findOldestPendingCreatedAt();
 }

@@ -6,6 +6,7 @@ import io.ledgerstream.application.port.out.IdempotencyStore;
 import io.ledgerstream.domain.model.AccountId;
 import io.ledgerstream.domain.model.BookingId;
 import io.ledgerstream.domain.model.IdempotencyKey;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 
@@ -72,6 +73,9 @@ public final class JdbcIdempotencyStore implements IdempotencyStore {
             )) {
                 throw new DuplicateIdempotencyKeyException(accountId, idempotencyKey);
             }
+            throw exception;
+        } catch (DataAccessException exception) {
+            PostgresErrorTranslator.rethrowIfLockTimeout(exception, "idempotency key insert");
             throw exception;
         }
     }

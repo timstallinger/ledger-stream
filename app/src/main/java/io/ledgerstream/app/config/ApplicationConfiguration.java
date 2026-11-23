@@ -21,11 +21,13 @@ import io.ledgerstream.application.port.out.BookingRepository;
 import io.ledgerstream.application.port.out.IdempotencyStore;
 import io.ledgerstream.application.port.out.OutboxEventPublisher;
 import io.ledgerstream.application.port.out.OutboxPayloadSerializer;
+import io.ledgerstream.application.port.out.OutboxRelayObserver;
 import io.ledgerstream.application.port.out.OutboxRepository;
 import io.ledgerstream.application.port.out.TransactionRunner;
 import io.ledgerstream.application.service.AccountService;
 import io.ledgerstream.application.service.BookingService;
 import io.ledgerstream.application.service.OutboxRelayService;
+import io.ledgerstream.application.service.OutboxRetryBackoff;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.admin.NewTopic;
@@ -41,6 +43,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.transaction.PlatformTransactionManager;
 
 import java.time.Clock;
+import java.time.Duration;
 
 @Configuration
 @EnableConfigurationProperties({KafkaTopicProperties.class, OutboxRelayProperties.class})
@@ -132,19 +135,34 @@ public class ApplicationConfiguration {
     }
 
     @Bean
+    public OutboxRelayObserver outboxRelayObserver(final MeterRegistry meterRegistry) {
+        return new ObservabilityOutboxRelayObserver(meterRegistry);
+    }
+
+    @Bean
+    public OutboxRetryBackoff outboxRetryBackoff() {
+        return new OutboxRetryBackoff();
+    }
+
+    @Bean
     public OutboxRelayService outboxRelayService(
             final OutboxRepository outboxRepository,
             final OutboxEventPublisher outboxEventPublisher,
+            final OutboxRelayObserver outboxRelayObserver,
             final TransactionRunner transactionRunner,
             final Clock clock,
+            final OutboxRetryBackoff outboxRetryBackoff,
             final OutboxRelayProperties relayProperties
     ) {
         return new OutboxRelayService(
                 outboxRepository,
                 outboxEventPublisher,
+                outboxRelayObserver,
                 transactionRunner,
                 clock,
-                relayProperties.batchSize()
+                outboxRetryBackoff,
+                relayProperties.batchSize(),
+                relayProperties.maxAttempts()
         );
     }
 
@@ -155,6 +173,20 @@ public class ApplicationConfiguration {
     ) {
         return Gauge.builder("outbox_unsent_total", outboxRepository, OutboxRepository::countPending)
                 .description("Number of PENDING outbox events waiting to be relayed to Kafka")
+                .register(meterRegistry);
+    }
+
+    @Bean
+    public Gauge outboxOldestPendingAgeSecondsGauge(
+            final OutboxRepository outboxRepository,
+            final Clock clock,
+            final MeterRegistry meterRegistry
+    ) {
+        return Gauge.builder("outbox_oldest_pending_age_seconds", outboxRepository, repo ->
+                        repo.findOldestPendingCreatedAt()
+                                .map(oldest -> Math.max(0.0, Duration.between(oldest, clock.instant()).toMillis() / 1000.0))
+                                .orElse(0.0))
+                .description("Age in seconds of the oldest PENDING outbox event, or 0 when no events are pending")
                 .register(meterRegistry);
     }
 

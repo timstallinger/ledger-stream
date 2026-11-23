@@ -35,6 +35,37 @@ Jede schreibende Buchungsoperation (`POST /api/v1/accounts/{id}/bookings`, `POST
 2. **Byte-gleiches Replay:** Ein wiederholter Request mit demselben `(account_id, idempotency_key)` führt keinen zweiten Buchungseffekt aus und liefert den persistierten HTTP-Status sowie den **byte-identischen** Response-Body zurück (ergänzt um den informativen Header `Idempotency-Replayed: true`).
 3. **Nur `2xx` wird gecacht:** Ablehnungen (`400`, `404`, `422`) rollen die Transaktion zurück und werden **nicht** in `idempotency_keys` gespeichert (zusätzlich durch `CHECK (response_status BETWEEN 200 AND 299)` in PostgreSQL erzwungen). Ein korrigierter Retry mit demselben Schlüssel wird danach regulär verarbeitet.
 4. **Gleichzeitige Requests mit identischem Schlüssel:** Treffen parallele Requests mit demselben `(account_id, idempotency_key)` ein, gewinnt genau eine Transaktion über den Unique-Index bzw. das optimistische Locking. Verlierer-Requests lesen die gespeicherte Antwort des Gewinners und liefern sie byte-gleich zurück — **kein `409 Conflict`**.
+5. **Lock-Timeout-Schutz (`lock_timeout = 3s`):** Blockiert ein konkurrierender Request am Unique-Index oder Zeilen-Lock länger als `3s` (z. B. durch eine langsame Gewinner-Transaktion), bricht PostgreSQL mit `SQLSTATE 55P03` ab. Die API übersetzt dies in HTTP **`503 Service Unavailable`** mit Header **`Retry-After: 1`** (RFC 7807 `errorCode: LOCK_TIMEOUT`), sodass kein Request-Thread unbegrenzt hängt.
+
+## Outbox-Betrieb, Metriken & PostgreSQL-Parameter
+
+### Outbox-Alarmierung (Prometheus-Beispiel)
+
+Ein reiner Zähler wie `outbox_unsent` reicht nicht aus, um ein stehendes Relay von normalem Last-Backlog zu unterscheiden. Entscheidend ist das Alter des ältesten `PENDING`-Events (`outbox_oldest_pending_age_seconds`):
+
+```yaml
+- alert: OutboxRelayStalled
+  expr: outbox_oldest_pending_age_seconds > 300
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Outbox-Relay hängt oder ist ausgefallen"
+    description: "Ältestes PENDING-Outbox-Event wartet seit > 300s (Wert: {{ $value }}s)."
+```
+
+Weitere Outbox-Metriken: `outbox_unsent` (Micrometer: `outbox_unsent_total`), `outbox_events_failed_total` (Events im Status `FAILED` nach `N=10` fehlgeschlagenen Versuchen mit exponentiellem Backoff `1s..60s` ±20 % Jitter).
+
+### Verifizierte PostgreSQL-Parameter (Docker Compose)
+
+Nach Start von `postgres` per `SHOW` bestätigt:
+
+```text
+shared_buffers       = 64MB
+work_mem             = 4MB
+maintenance_work_mem = 32MB
+lock_timeout         = 3s
+```
 
 ## Schnellstart
 

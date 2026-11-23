@@ -11,6 +11,7 @@ import io.ledgerstream.domain.model.CurrencyCode;
 import io.ledgerstream.domain.model.IdempotencyKey;
 import io.ledgerstream.domain.model.Money;
 import io.ledgerstream.domain.model.Reference;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 
@@ -67,6 +68,9 @@ public final class JdbcBookingRepository implements BookingRepository {
             )) {
                 throw new DuplicateIdempotencyKeyException(booking.accountId(), booking.idempotencyKey());
             }
+            throw exception;
+        } catch (DataAccessException exception) {
+            PostgresErrorTranslator.rethrowIfLockTimeout(exception, "booking insert");
             throw exception;
         }
     }
