@@ -32,3 +32,8 @@ frontend/.vite/
 .env.local
 PLAN.md
 *.log
+
+# Tooling directories
+.antigravity/
+.cursor/
+.aider*
