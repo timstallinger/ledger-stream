@@ -8,7 +8,6 @@ import io.ledgerstream.adapter.out.messaging.avro.LedgerBookingEvent;
 import io.ledgerstream.application.port.in.CreateBookingCommand;
 import io.ledgerstream.application.port.in.CreateBookingUseCase;
 import io.ledgerstream.application.port.in.RelayOutboxUseCase;
-import io.ledgerstream.application.port.in.StoredIdempotentResponse;
 import io.ledgerstream.application.port.out.OutboxEvent;
 import io.ledgerstream.application.port.out.OutboxEventPublisher;
 import io.ledgerstream.application.port.out.OutboxRepository;
@@ -30,6 +29,7 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -71,6 +71,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = "ledger.outbox.relay.enabled=false"
 )
+@AutoConfigureObservability
 @Testcontainers
 final class TransactionalOutboxIT {
 
@@ -204,7 +205,7 @@ final class TransactionalOutboxIT {
 
         ResponseEntity<String> prometheus = restTemplate.getForEntity("/actuator/prometheus", String.class);
         assertThat(prometheus.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(prometheus.getBody()).contains("outbox_unsent_total 1.0");
+        assertThat(prometheus.getBody()).contains("outbox_unsent 1.0");
 
         int relayed = relayOutboxUseCase.relayPendingBatch();
         assertThat(relayed).isEqualTo(1);

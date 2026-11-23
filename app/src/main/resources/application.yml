@@ -16,8 +16,11 @@ spring:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
       properties:
         enable.idempotence: true
+        schema.registry.url: ${SCHEMA_REGISTRY_URL:http://localhost:8081}
     consumer:
       enable-auto-commit: false
       auto-offset-reset: earliest
@@ -30,6 +33,12 @@ ledger:
     topics:
       ledger-events: ${LEDGER_EVENTS_TOPIC:ledger.events}
       ledger-events-dlq: ${LEDGER_EVENTS_DLQ_TOPIC:ledger.events.dlq}
+  outbox:
+    relay:
+      enabled: ${OUTBOX_RELAY_ENABLED:true}
+      batch-size: ${OUTBOX_RELAY_BATCH_SIZE:500}
+      fixed-delay-ms: ${OUTBOX_RELAY_FIXED_DELAY_MS:500}
+      publish-timeout-ms: ${OUTBOX_RELAY_PUBLISH_TIMEOUT_MS:10000}
 
 management:
   endpoints:
