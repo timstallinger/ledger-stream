@@ -108,7 +108,7 @@ final class TransactionalOutboxIT {
                     .withEnv("SCHEMA_REGISTRY_LISTENERS", "http://0.0.0.0:8081")
                     .withEnv("SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS", "PLAINTEXT://kafka:19092")
                     .withEnv("SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR", "1")
-                    .withEnv("SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL", "BACKWARD")
+                    .withEnv("SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL", "FULL")
                     .waitingFor(Wait.forHttp("/subjects").forStatusCode(200).withStartupTimeout(Duration.ofSeconds(90)));
 
     @DynamicPropertySource
@@ -249,7 +249,8 @@ final class TransactionalOutboxIT {
         assertThat(payload.getAmount()).isEqualTo("125.00");
         assertThat(payload.getCurrency()).isEqualTo("EUR");
         assertThat(payload.getVersion()).isEqualTo(1L);
-        assertThat(payload.getSchemaVersion()).isEqualTo(1);
+        assertThat(payload.getSchemaVersion()).isEqualTo(2);
+        assertThat(payload.getInitiationChannel()).isEqualTo("API");
         assertThat(new String(record.headers().lastHeader("eventId").value(), StandardCharsets.UTF_8))
                 .isEqualTo(payload.getEventId());
     }

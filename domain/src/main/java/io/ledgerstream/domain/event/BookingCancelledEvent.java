@@ -23,7 +23,7 @@ public record BookingCancelledEvent(
 ) implements DomainEvent {
 
     public static final String EVENT_TYPE = "BookingCancelled";
-    public static final int CURRENT_SCHEMA_VERSION = 1;
+    public static final int CURRENT_SCHEMA_VERSION = 2;
 
     public BookingCancelledEvent {
         Objects.requireNonNull(eventId, "eventId must not be null");

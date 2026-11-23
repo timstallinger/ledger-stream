@@ -86,6 +86,7 @@ public final class JacksonOutboxPayloadSerializer implements OutboxPayloadSerial
         map.put("version", version);
         map.put("occurredAt", occurredAt);
         map.put("schemaVersion", schemaVersion);
+        map.put("initiationChannel", "API");
         return map;
     }
 }

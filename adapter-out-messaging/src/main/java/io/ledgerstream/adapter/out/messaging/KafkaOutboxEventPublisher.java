@@ -72,6 +72,10 @@ public final class KafkaOutboxEventPublisher implements OutboxEventPublisher {
             JsonNode root = objectMapper.readTree(event.payload());
             JsonNode originalNode = root.get("originalBookingId");
             String originalBookingId = (originalNode == null || originalNode.isNull()) ? null : originalNode.asText();
+            JsonNode channelNode = root.get("initiationChannel");
+            String initiationChannel = (channelNode == null || channelNode.isNull() || channelNode.asText().isBlank())
+                    ? "API"
+                    : channelNode.asText();
             return LedgerBookingEvent.newBuilder()
                     .setEventId(root.get("eventId").asText())
                     .setEventType(root.get("eventType").asText())
@@ -85,6 +89,7 @@ public final class KafkaOutboxEventPublisher implements OutboxEventPublisher {
                     .setVersion(root.get("version").asLong())
                     .setOccurredAt(root.get("occurredAt").asText())
                     .setSchemaVersion(root.get("schemaVersion").asInt())
+                    .setInitiationChannel(initiationChannel)
                     .build();
         } catch (Exception exception) {
             throw new IllegalStateException("Failed to map outbox event " + event.id() + " to Avro record", exception);

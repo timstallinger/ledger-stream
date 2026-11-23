@@ -1,6 +1,7 @@
 package io.ledgerstream.adapter.in.messaging;
 
 import io.ledgerstream.application.port.in.IncomingLedgerEvent;
+import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 
 import java.math.BigDecimal;
@@ -27,6 +28,11 @@ public final class LedgerEventRecordMapper {
             long version = parseLong(record.get("version"));
             Instant occurredAt = parseInstant(record.get("occurredAt"));
             int schemaVersion = parseInt(record.get("schemaVersion"), 1);
+            String initiationChannel = readOptionalFieldWithDefault(
+                    record,
+                    "initiationChannel",
+                    IncomingLedgerEvent.DEFAULT_INITIATION_CHANNEL
+            );
 
             return Optional.of(new IncomingLedgerEvent(
                     eventId,
@@ -40,11 +46,30 @@ public final class LedgerEventRecordMapper {
                     reference,
                     version,
                     occurredAt,
-                    schemaVersion
+                    schemaVersion,
+                    initiationChannel
             ));
         } catch (RuntimeException exception) {
             return Optional.empty();
         }
+    }
+
+    private static String readOptionalFieldWithDefault(
+            final GenericRecord record,
+            final String fieldName,
+            final String defaultValue
+    ) {
+        Schema.Field field = record.getSchema().getField(fieldName);
+        if (field == null) {
+            return defaultValue;
+        }
+        Object rawValue = record.get(fieldName);
+        if (rawValue == null) {
+            Object schemaDefault = field.defaultVal();
+            return schemaDefault != null ? schemaDefault.toString() : defaultValue;
+        }
+        String text = rawValue.toString();
+        return text.isBlank() ? defaultValue : text;
     }
 
     private static String asString(final Object value) {

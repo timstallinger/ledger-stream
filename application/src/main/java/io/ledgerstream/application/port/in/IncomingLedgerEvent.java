@@ -16,6 +16,36 @@ public record IncomingLedgerEvent(
         String reference,
         long version,
         Instant occurredAt,
-        int schemaVersion
+        int schemaVersion,
+        String initiationChannel
 ) {
+
+    public static final String DEFAULT_INITIATION_CHANNEL = "API";
+
+    public IncomingLedgerEvent {
+        if (initiationChannel == null || initiationChannel.isBlank()) {
+            initiationChannel = DEFAULT_INITIATION_CHANNEL;
+        }
+    }
+
+    public IncomingLedgerEvent(
+            final UUID eventId,
+            final String eventType,
+            final UUID aggregateId,
+            final UUID bookingId,
+            final UUID originalBookingId,
+            final String bookingType,
+            final BigDecimal amount,
+            final String currency,
+            final String reference,
+            final long version,
+            final Instant occurredAt,
+            final int schemaVersion
+    ) {
+        this(
+                eventId, eventType, aggregateId, bookingId, originalBookingId,
+                bookingType, amount, currency, reference, version, occurredAt,
+                schemaVersion, DEFAULT_INITIATION_CHANNEL
+        );
+    }
 }

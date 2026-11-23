@@ -22,7 +22,7 @@ public record BookingCreatedEvent(
 ) implements DomainEvent {
 
     public static final String EVENT_TYPE = "BookingCreated";
-    public static final int CURRENT_SCHEMA_VERSION = 1;
+    public static final int CURRENT_SCHEMA_VERSION = 2;
 
     public BookingCreatedEvent {
         Objects.requireNonNull(eventId, "eventId must not be null");

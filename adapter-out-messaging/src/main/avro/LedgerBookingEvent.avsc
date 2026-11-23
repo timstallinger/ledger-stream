@@ -2,7 +2,7 @@
   "type": "record",
   "name": "LedgerBookingEvent",
   "namespace": "io.ledgerstream.adapter.out.messaging.avro",
-  "doc": "Canonical ledger booking domain event (v1). Additional optional fields with defaults can be appended without breaking BACKWARD compatibility.",
+  "doc": "Canonical ledger booking domain event (v2, FULL-compatible with v1 via default initiationChannel).",
   "fields": [
     { "name": "eventId", "type": "string" },
     { "name": "eventType", "type": "string" },
@@ -15,6 +15,7 @@
     { "name": "reference", "type": "string" },
     { "name": "version", "type": "long" },
     { "name": "occurredAt", "type": "string" },
-    { "name": "schemaVersion", "type": "int", "default": 1 }
+    { "name": "schemaVersion", "type": "int", "default": 2 },
+    { "name": "initiationChannel", "type": "string", "default": "API" }
   ]
 }

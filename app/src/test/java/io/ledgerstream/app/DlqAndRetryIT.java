@@ -120,7 +120,7 @@ final class DlqAndRetryIT {
                     .withEnv("SCHEMA_REGISTRY_LISTENERS", "http://0.0.0.0:8081")
                     .withEnv("SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS", "PLAINTEXT://kafka:19092")
                     .withEnv("SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR", "1")
-                    .withEnv("SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL", "BACKWARD")
+                    .withEnv("SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL", "FULL")
                     .waitingFor(Wait.forHttp("/subjects").forStatusCode(200).withStartupTimeout(Duration.ofSeconds(90)));
 
     @DynamicPropertySource
@@ -244,14 +244,13 @@ final class DlqAndRetryIT {
     private MeterRegistry meterRegistry;
 
     @Test
-    void t1T3T4TechnicalFailureExhaustsFiveAttemptsLandsInDlqAndReplaysIdempotently() throws Exception {
-        String accountId = createAccount("DE-T134-" + shortId());
+    void t1_technicalFailureExhaustsFiveAttemptsAndLandsInDlqWithHeaders() throws Exception {
+        String accountId = createAccount("DE-T1-" + shortId());
         UUID failingEventId = UUID.randomUUID();
         String correlationId = "corr-t1-" + shortId();
         faultSwitch.failEvent(failingEventId);
 
         double retriesBefore = counterValue("consumer_retries_total");
-        double replayedBefore = counterValue("dlq_replayed_total");
         double unhandledBefore = gaugeValue("dlq_entries_unhandled");
 
         LedgerBookingEvent event = avroEvent(failingEventId, accountId, "CREDIT", "111.00", "EUR", 1L);
@@ -260,7 +259,6 @@ final class DlqAndRetryIT {
         producerRecord.headers().add(new RecordHeader("X-Correlation-Id", correlationId.getBytes(StandardCharsets.UTF_8)));
         kafkaTemplate.send(producerRecord).get(10, TimeUnit.SECONDS);
 
-        // T1: Wait until all 5 attempts fail and DLQ entry is persisted
         awaitCondition(Duration.ofSeconds(30), () -> findDlqEntryByEventId(failingEventId).isPresent());
 
         DlqEntry dlqEntry = findDlqEntryByEventId(failingEventId).orElseThrow();
@@ -284,108 +282,14 @@ final class DlqAndRetryIT {
         assertThat(counterValue("consumer_retries_total")).isGreaterThanOrEqualTo(retriesBefore + 4.0);
         assertThat(gaugeValue("dlq_entries_unhandled")).isGreaterThanOrEqualTo(unhandledBefore + 1.0);
         assertThat(accountSummaryRepository.findByAccountId(AccountId.of(UUID.fromString(accountId)))).isEmpty();
-
-        // T3: Fix underlying issue, replay DLQ entry via admin endpoint -> processed exactly once & marked replayed
-        faultSwitch.clearFailure(failingEventId);
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        ResponseEntity<String> replayResponse = restTemplate.postForEntity(
-                "/admin/dlq/" + dlqEntry.id() + "/replay",
-                new HttpEntity<>("{\"replayedBy\":\"operator-test\",\"note\":\"DB recovered\"}", headers),
-                String.class
-        );
-        assertThat(replayResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
-        JsonNode replayJson = objectMapper.readTree(replayResponse.getBody());
-        assertThat(replayJson.get("replayedAt").isNull()).isFalse();
-        assertThat(replayJson.get("replayedBy").asText()).isEqualTo("operator-test");
-        assertThat(replayJson.get("note").asText()).isEqualTo("DB recovered");
-        assertThat(counterValue("dlq_replayed_total")).isEqualTo(replayedBefore + 1.0);
-
-        AccountId domainAccountId = AccountId.of(UUID.fromString(accountId));
-        awaitCondition(
-                Duration.ofSeconds(15),
-                () -> accountSummaryRepository.findByAccountId(domainAccountId)
-                        .map(s -> s.bookingCount() == 1L)
-                        .orElse(false)
-        );
-        AccountSummary afterReplay = accountSummaryRepository.findByAccountId(domainAccountId).orElseThrow();
-        assertThat(afterReplay.balance()).isEqualByComparingTo("111.00");
-        assertThat(afterReplay.bookingCount()).isEqualTo(1L);
-
-        // Unknown DLQ id -> 404
-        ResponseEntity<String> unknownReplay = restTemplate.postForEntity(
-                "/admin/dlq/" + UUID.randomUUID() + "/replay",
-                new HttpEntity<>("{}", headers),
-                String.class
-        );
-        assertThat(unknownReplay.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-
-        // T4a: Replaying the exact same DLQ entry a second time -> 409 Conflict
-        ResponseEntity<String> duplicateHttpReplay = restTemplate.postForEntity(
-                "/admin/dlq/" + dlqEntry.id() + "/replay",
-                new HttpEntity<>("{\"replayedBy\":\"operator-test\",\"note\":\"Accidental double click\"}", headers),
-                String.class
-        );
-        assertThat(duplicateHttpReplay.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-
-        // T4b: Even if a duplicate DLQ row with the same eventId is replayed -> processed_events prevents second effect
-        double dupBefore = meterRegistry.find("consumer_duplicates_rejected_total")
-                .tag("reason", "duplicate")
-                .counter()
-                .count();
-        UUID secondDlqId = UUID.randomUUID();
-        dlqRepository.save(new DlqEntry(
-                secondDlqId,
-                dlqEntry.topic(),
-                dlqEntry.partition(),
-                dlqEntry.offset() + 1000,
-                dlqEntry.recordKey(),
-                dlqEntry.eventId(),
-                dlqEntry.errorClass(),
-                dlqEntry.errorMessage(),
-                dlqEntry.attemptCount(),
-                dlqEntry.payload(),
-                dlqEntry.headers(),
-                Instant.now(),
-                null,
-                null,
-                null
-        ));
-        ResponseEntity<String> secondReplay = restTemplate.postForEntity(
-                "/admin/dlq/" + secondDlqId + "/replay",
-                new HttpEntity<>("{\"replayedBy\":\"operator-test\",\"note\":\"Duplicate replay proof\"}", headers),
-                String.class
-        );
-        assertThat(secondReplay.getStatusCode()).isEqualTo(HttpStatus.OK);
-
-        awaitCondition(
-                Duration.ofSeconds(15),
-                () -> meterRegistry.find("consumer_duplicates_rejected_total")
-                        .tag("reason", "duplicate")
-                        .counter()
-                        .count() >= dupBefore + 1.0
-        );
-        AccountSummary afterDoubleReplay = accountSummaryRepository.findByAccountId(domainAccountId).orElseThrow();
-        assertThat(afterDoubleReplay.balance()).isEqualByComparingTo("111.00");
-        assertThat(afterDoubleReplay.bookingCount()).isEqualTo(1L);
-
-        // Print Prometheus metrics sample for verification report
-        ResponseEntity<String> prometheus = restTemplate.getForEntity("/actuator/prometheus", String.class);
-        assertThat(prometheus.getStatusCode()).isEqualTo(HttpStatus.OK);
-        prometheus.getBody().lines()
-                .filter(line -> !line.startsWith("#"))
-                .filter(line -> line.startsWith("dlq_") || line.startsWith("consumer_retries"))
-                .forEach(line -> System.out.println("PHASE5_PROMETHEUS: " + line));
     }
 
     @Test
-    void t2PartitionContinuesProcessingValidMessageUnderTwoSecondsWhileFailingMessageRetries() throws Exception {
+    void t2_partitionContinuesUnderTwoSecondsWhileFailingMessageRetries() throws Exception {
         String accountId = createAccount("DE-T2-" + shortId());
         UUID failingEventId = UUID.randomUUID();
         faultSwitch.failEvent(failingEventId);
 
-        // 1) Publish failing event on partition(accountId)
         kafkaTemplate.send(
                 topicProperties.ledgerEvents(),
                 accountId,
@@ -395,7 +299,6 @@ final class DlqAndRetryIT {
         assertThat(faultSwitch.awaitFirstFailure(failingEventId, Duration.ofSeconds(15))).isTrue();
         long startNanos = System.nanoTime();
 
-        // 2) Immediately publish valid event on the EXACT SAME key/partition while failingEventId is in retry
         kafkaTemplate.send(
                 topicProperties.ledgerEvents(),
                 accountId,
@@ -412,25 +315,134 @@ final class DlqAndRetryIT {
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
         System.out.println("T2_NON_BLOCKING_ELAPSED_MS=" + elapsedMs);
 
-        // Valid event processed in < 2000 ms on the SAME partition while failing event is still retrying
         assertThat(elapsedMs).isLessThan(2000L);
         assertThat(accountSummaryRepository.findByAccountId(domainAccountId).orElseThrow().balance())
                 .isEqualByComparingTo("75.00");
 
-        // Eventually the failing event finishes its 5 attempts and lands in DLQ
         awaitCondition(Duration.ofSeconds(30), () -> findDlqEntryByEventId(failingEventId).isPresent());
         assertThat(findDlqEntryByEventId(failingEventId).orElseThrow().attemptCount()).isEqualTo(5);
     }
 
     @Test
-    void t5DeserializationPoisonPreservesByteIdenticalRawPayloadAndSucceedsOnReplayAfterSchemaFix() throws Exception {
+    void t3_replayReprocessesDlqEntryOnceAndMarksReplayed() throws Exception {
+        String accountId = createAccount("DE-T3-" + shortId());
+        UUID failingEventId = UUID.randomUUID();
+        faultSwitch.failEvent(failingEventId);
+
+        kafkaTemplate.send(
+                topicProperties.ledgerEvents(),
+                accountId,
+                avroEvent(failingEventId, accountId, "CREDIT", "90.00", "EUR", 1L)
+        ).get(10, TimeUnit.SECONDS);
+        awaitCondition(Duration.ofSeconds(30), () -> findDlqEntryByEventId(failingEventId).isPresent());
+
+        DlqEntry dlqEntry = findDlqEntryByEventId(failingEventId).orElseThrow();
+        double replayedBefore = counterValue("dlq_replayed_total");
+        faultSwitch.clearFailure(failingEventId);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> replayResponse = restTemplate.postForEntity(
+                "/admin/dlq/" + dlqEntry.id() + "/replay",
+                new HttpEntity<>("{\"replayedBy\":\"operator-t3\",\"note\":\"DB recovered\"}", headers),
+                String.class
+        );
+        assertThat(replayResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode replayJson = objectMapper.readTree(replayResponse.getBody());
+        assertThat(replayJson.get("replayedAt").isNull()).isFalse();
+        assertThat(replayJson.get("replayedBy").asText()).isEqualTo("operator-t3");
+        assertThat(replayJson.get("note").asText()).isEqualTo("DB recovered");
+        assertThat(counterValue("dlq_replayed_total")).isEqualTo(replayedBefore + 1.0);
+
+        AccountId domainAccountId = AccountId.of(UUID.fromString(accountId));
+        awaitCondition(
+                Duration.ofSeconds(15),
+                () -> accountSummaryRepository.findByAccountId(domainAccountId)
+                        .map(s -> s.bookingCount() == 1L)
+                        .orElse(false)
+        );
+        assertThat(accountSummaryRepository.findByAccountId(domainAccountId).orElseThrow().balance())
+                .isEqualByComparingTo("90.00");
+
+        // Unknown DLQ entry -> 404
+        ResponseEntity<String> unknownReplay = restTemplate.postForEntity(
+                "/admin/dlq/" + UUID.randomUUID() + "/replay",
+                new HttpEntity<>("{}", headers),
+                String.class
+        );
+        assertThat(unknownReplay.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void t4_doubleReplayProtectedBy409GuardAndUniqueEventId() throws Exception {
+        String accountId = createAccount("DE-T4-" + shortId());
+        UUID eventId = UUID.randomUUID();
+        faultSwitch.failEvent(eventId);
+
+        kafkaTemplate.send(
+                topicProperties.ledgerEvents(),
+                accountId,
+                avroEvent(eventId, accountId, "CREDIT", "60.00", "EUR", 1L)
+        ).get(10, TimeUnit.SECONDS);
+        awaitCondition(Duration.ofSeconds(30), () -> findDlqEntryByEventId(eventId).isPresent());
+        DlqEntry dlqEntry = findDlqEntryByEventId(eventId).orElseThrow();
+
+        faultSwitch.clearFailure(eventId);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+
+        // First replay succeeds
+        ResponseEntity<String> firstReplay = restTemplate.postForEntity(
+                "/admin/dlq/" + dlqEntry.id() + "/replay",
+                new HttpEntity<>("{\"replayedBy\":\"operator-t4\",\"note\":\"First replay\"}", headers),
+                String.class
+        );
+        assertThat(firstReplay.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        AccountId domainAccountId = AccountId.of(UUID.fromString(accountId));
+        awaitCondition(
+                Duration.ofSeconds(15),
+                () -> accountSummaryRepository.findByAccountId(domainAccountId)
+                        .map(s -> s.bookingCount() == 1L)
+                        .orElse(false)
+        );
+
+        // Guarantee 1 (API layer): replaying the same DLQ entry a second time is rejected by replayed_at guard -> 409
+        ResponseEntity<String> secondHttpReplay = restTemplate.postForEntity(
+                "/admin/dlq/" + dlqEntry.id() + "/replay",
+                new HttpEntity<>("{\"replayedBy\":\"operator-t4\",\"note\":\"Second replay\"}", headers),
+                String.class
+        );
+        assertThat(secondHttpReplay.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(objectMapper.readTree(secondHttpReplay.getBody()).get("errorCode").asText())
+                .isEqualTo("DLQ_ENTRY_ALREADY_REPLAYED");
+
+        // Guarantee 2 (Consumer/DB layer): even if the exact raw payload is re-emitted to Kafka directly
+        // bypassing the HTTP guard, processed_events UNIQUE(event_id) rejects the duplicate -> zero second effect
+        double dupBefore = meterRegistry.find("consumer_duplicates_rejected_total")
+                .tag("reason", "duplicate")
+                .counter()
+                .count();
+        rawBytesKafkaTemplate.send(dlqEntry.topic(), dlqEntry.recordKey(), dlqEntry.payload()).get(10, TimeUnit.SECONDS);
+
+        awaitCondition(
+                Duration.ofSeconds(15),
+                () -> meterRegistry.find("consumer_duplicates_rejected_total")
+                        .tag("reason", "duplicate")
+                        .counter()
+                        .count() >= dupBefore + 1.0
+        );
+        AccountSummary afterDuplicate = accountSummaryRepository.findByAccountId(domainAccountId).orElseThrow();
+        assertThat(afterDuplicate.balance()).isEqualByComparingTo("60.00");
+        assertThat(afterDuplicate.bookingCount()).isEqualTo(1L);
+    }
+
+    @Test
+    void t5_deserializationPoisonPreservesRawBytesAndReplaysAfterSchemaFix() throws Exception {
         String accountId = createAccount("DE-T5-" + shortId());
         UUID eventId = UUID.randomUUID();
-
-        // Determine next unused Schema Registry ID so deserialization fails deterministically before schema registration
         int nextSchemaId = fetchHighestSchemaId() + 1;
 
-        // Build a valid Avro schema (distinct doc so Schema Registry registers it as nextSchemaId on fix)
         String distinctSchemaJson = """
                 {
                   "type": "record",
@@ -449,7 +461,8 @@ final class DlqAndRetryIT {
                     { "name": "reference", "type": "string" },
                     { "name": "version", "type": "long" },
                     { "name": "occurredAt", "type": "string" },
-                    { "name": "schemaVersion", "type": "int", "default": 1 }
+                    { "name": "schemaVersion", "type": "int", "default": 2 },
+                    { "name": "initiationChannel", "type": "string", "default": "API" }
                   ]
                 }
                 """.formatted(shortId());
@@ -462,7 +475,6 @@ final class DlqAndRetryIT {
                 "88.88"
         );
 
-        // Publish raw bytes BEFORE schema nextSchemaId exists in Schema Registry -> real deserialization failure!
         rawBytesKafkaTemplate.send(topicProperties.ledgerEvents(), accountId, rawWirePayload).get(10, TimeUnit.SECONDS);
 
         awaitCondition(Duration.ofSeconds(15), () -> findDlqEntryByRecordKey(accountId).isPresent());
@@ -478,19 +490,9 @@ final class DlqAndRetryIT {
         assertThat(poisonEntry.headers().get(DlqRecordPersister.HEADER_SCHEMA_ID))
                 .isEqualTo(Integer.toString(nextSchemaId));
 
-        // Log SQL row (without binary payload) for Phase 5 verification report
-        List<Map<String, Object>> sqlRows = jdbcClient.sql(
-                        "SELECT id, error_class, attempt_count FROM dlq_entries WHERE id = :id")
-                .param("id", poisonEntry.id())
-                .query()
-                .listOfRows();
-        System.out.println("T5_DLQ_SQL_ROW=" + sqlRows);
-
-        // Schema Fix: register the missing schema in Schema Registry -> gets assigned nextSchemaId
         int registeredId = registerSchema("ledger.events-t5-fix-" + shortId() + "-value", distinctSchemaJson);
         assertThat(registeredId).isEqualTo(nextSchemaId);
 
-        // Replay the preserved raw bytes -> consumer now deserializes cleanly and projects +88.88!
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         ResponseEntity<String> replayResponse = restTemplate.postForEntity(
@@ -507,9 +509,64 @@ final class DlqAndRetryIT {
                         .map(s -> s.bookingCount() == 1L)
                         .orElse(false)
         );
-        AccountSummary recovered = accountSummaryRepository.findByAccountId(domainAccountId).orElseThrow();
-        assertThat(recovered.balance()).isEqualByComparingTo("88.88");
-        assertThat(recovered.bookingCount()).isEqualTo(1L);
+        assertThat(accountSummaryRepository.findByAccountId(domainAccountId).orElseThrow().balance())
+                .isEqualByComparingTo("88.88");
+    }
+
+    @Test
+    void v2_failedReplayReopensExistingDlqEntryAndIncrementsAttemptCount() throws Exception {
+        String accountId = createAccount("DE-V2-" + shortId());
+        UUID eventId = UUID.randomUUID();
+        faultSwitch.failEvent(eventId);
+
+        // Initial failure -> 5 attempts -> 1 open DLQ entry with attempt_count = 5
+        kafkaTemplate.send(
+                topicProperties.ledgerEvents(),
+                accountId,
+                avroEvent(eventId, accountId, "CREDIT", "33.00", "EUR", 1L)
+        ).get(10, TimeUnit.SECONDS);
+        awaitCondition(Duration.ofSeconds(30), () -> findDlqEntryByEventId(eventId).isPresent());
+
+        DlqEntry firstFailure = findDlqEntryByEventId(eventId).orElseThrow();
+        assertThat(firstFailure.attemptCount()).isEqualTo(5);
+
+        // Replay WITHOUT clearing the fault -> fails another 5 attempts and re-enters DLQ
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> replayResponse = restTemplate.postForEntity(
+                "/admin/dlq/" + firstFailure.id() + "/replay",
+                new HttpEntity<>("{\"replayedBy\":\"operator-v2\",\"note\":\"Premature replay before DB fix\"}", headers),
+                String.class
+        );
+        assertThat(replayResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        // Wait until the existing entry is reopened with attempt_count == 10 (5 + 5)
+        awaitCondition(
+                Duration.ofSeconds(30),
+                () -> findDlqEntryByEventId(eventId).map(e -> e.attemptCount() == 10).orElse(false)
+        );
+
+        Integer openCountForEvent = jdbcClient.sql(
+                        "SELECT COUNT(*) FROM dlq_entries WHERE event_id = :eventId AND replayed_at IS NULL")
+                .param("eventId", eventId)
+                .query(Integer.class)
+                .single();
+        Integer totalCountForEvent = jdbcClient.sql(
+                        "SELECT COUNT(*) FROM dlq_entries WHERE event_id = :eventId")
+                .param("eventId", eventId)
+                .query(Integer.class)
+                .single();
+        List<Map<String, Object>> sqlRow = jdbcClient.sql(
+                        "SELECT id, event_id, error_class, attempt_count, replayed_at FROM dlq_entries WHERE event_id = :eventId")
+                .param("eventId", eventId)
+                .query()
+                .listOfRows();
+        System.out.println("V2_DLQ_REENTRY_SQL=" + sqlRow);
+
+        assertThat(openCountForEvent).isEqualTo(1);
+        assertThat(totalCountForEvent).isEqualTo(1);
+        assertThat(findDlqEntryByEventId(eventId).orElseThrow().id()).isEqualTo(firstFailure.id());
+        assertThat(findDlqEntryByEventId(eventId).orElseThrow().attemptCount()).isEqualTo(10);
     }
 
     private Optional<DlqEntry> findDlqEntryByEventId(final UUID eventId) {
@@ -570,7 +627,8 @@ final class DlqAndRetryIT {
         record.put("reference", "T5 schema recovery");
         record.put("version", 1L);
         record.put("occurredAt", Instant.now().toString());
-        record.put("schemaVersion", 1);
+        record.put("schemaVersion", 2);
+        record.put("initiationChannel", "API");
 
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         out.write(0x00);
@@ -598,10 +656,11 @@ final class DlqAndRetryIT {
                 .setBookingType(bookingType)
                 .setAmount(amount)
                 .setCurrency(currency)
-                .setReference("Phase 5 IT")
+                .setReference("Phase 5/6 IT")
                 .setVersion(version)
                 .setOccurredAt(Instant.now().toString())
-                .setSchemaVersion(1)
+                .setSchemaVersion(2)
+                .setInitiationChannel("API")
                 .build();
     }
 

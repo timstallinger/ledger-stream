@@ -110,7 +110,7 @@ final class BookingTest {
         assertThat(created.aggregateId()).isEqualTo(accountId.value());
         assertThat(created.version()).isEqualTo(1L);
         assertThat(created.occurredAt()).isEqualTo(T0);
-        assertThat(created.schemaVersion()).isEqualTo(1);
+        assertThat(created.schemaVersion()).isEqualTo(2);
         assertThat(created.eventType()).isEqualTo("BookingCreated");
 
         Booking.CancellationPair pair = booking.cancel(
@@ -130,7 +130,7 @@ final class BookingTest {
         assertThat(cancelled.aggregateId()).isEqualTo(accountId.value());
         assertThat(cancelled.version()).isEqualTo(2L);
         assertThat(cancelled.occurredAt()).isEqualTo(T1);
-        assertThat(cancelled.schemaVersion()).isEqualTo(1);
+        assertThat(cancelled.schemaVersion()).isEqualTo(2);
         assertThat(cancelled.eventType()).isEqualTo("BookingCancelled");
     }
 }

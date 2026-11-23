@@ -109,7 +109,7 @@ final class IdempotentConsumerIT {
                     .withEnv("SCHEMA_REGISTRY_LISTENERS", "http://0.0.0.0:8081")
                     .withEnv("SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS", "PLAINTEXT://kafka:19092")
                     .withEnv("SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR", "1")
-                    .withEnv("SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL", "BACKWARD")
+                    .withEnv("SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL", "FULL")
                     .waitingFor(Wait.forHttp("/subjects").forStatusCode(200).withStartupTimeout(Duration.ofSeconds(90)));
 
     @DynamicPropertySource
@@ -518,7 +518,8 @@ final class IdempotentConsumerIT {
                 .setReference("IT event")
                 .setVersion(version)
                 .setOccurredAt(Instant.now().toString())
-                .setSchemaVersion(1)
+                .setSchemaVersion(2)
+                .setInitiationChannel("API")
                 .build();
     }
 
