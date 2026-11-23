@@ -49,12 +49,18 @@ public final class JdbcAccountRepository implements AccountRepository {
                     .update();
             return account;
         } catch (DataIntegrityViolationException exception) {
-            if (PostgresErrorTranslator.isSqlState(exception, PostgresErrorTranslator.SQL_STATE_UNIQUE_VIOLATION)
-                    && PostgresErrorTranslator.mentionsConstraint(exception, CONSTRAINT_ACCOUNT_NUMBER)) {
+            if (PostgresErrorTranslator.isConstraintViolation(
+                    exception,
+                    PostgresErrorTranslator.SQL_STATE_UNIQUE_VIOLATION,
+                    CONSTRAINT_ACCOUNT_NUMBER
+            )) {
                 throw new DuplicateAccountNumberException(account.accountNumber());
             }
-            if (PostgresErrorTranslator.isSqlState(exception, PostgresErrorTranslator.SQL_STATE_CHECK_VIOLATION)
-                    && PostgresErrorTranslator.mentionsConstraint(exception, CONSTRAINT_BALANCE_NON_NEGATIVE)) {
+            if (PostgresErrorTranslator.isConstraintViolation(
+                    exception,
+                    PostgresErrorTranslator.SQL_STATE_CHECK_VIOLATION,
+                    CONSTRAINT_BALANCE_NON_NEGATIVE
+            )) {
                 throw new InsufficientBalanceException(account.id());
             }
             throw exception;
@@ -82,8 +88,11 @@ public final class JdbcAccountRepository implements AccountRepository {
             }
             return account;
         } catch (DataIntegrityViolationException exception) {
-            if (PostgresErrorTranslator.isSqlState(exception, PostgresErrorTranslator.SQL_STATE_CHECK_VIOLATION)
-                    && PostgresErrorTranslator.mentionsConstraint(exception, CONSTRAINT_BALANCE_NON_NEGATIVE)) {
+            if (PostgresErrorTranslator.isConstraintViolation(
+                    exception,
+                    PostgresErrorTranslator.SQL_STATE_CHECK_VIOLATION,
+                    CONSTRAINT_BALANCE_NON_NEGATIVE
+            )) {
                 throw new InsufficientBalanceException(account.id());
             }
             throw exception;

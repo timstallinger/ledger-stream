@@ -60,8 +60,11 @@ public final class JdbcBookingRepository implements BookingRepository {
                     .update();
             return booking;
         } catch (DataIntegrityViolationException exception) {
-            if (PostgresErrorTranslator.isSqlState(exception, PostgresErrorTranslator.SQL_STATE_UNIQUE_VIOLATION)
-                    && PostgresErrorTranslator.mentionsConstraint(exception, CONSTRAINT_BOOKING_IDEMPOTENCY)) {
+            if (PostgresErrorTranslator.isConstraintViolation(
+                    exception,
+                    PostgresErrorTranslator.SQL_STATE_UNIQUE_VIOLATION,
+                    CONSTRAINT_BOOKING_IDEMPOTENCY
+            )) {
                 throw new DuplicateIdempotencyKeyException(booking.accountId(), booking.idempotencyKey());
             }
             throw exception;

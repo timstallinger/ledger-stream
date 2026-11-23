@@ -65,8 +65,11 @@ public final class JdbcIdempotencyStore implements IdempotencyStore {
                     .param("responseBody", response.responseBody())
                     .update();
         } catch (DataIntegrityViolationException exception) {
-            if (PostgresErrorTranslator.isSqlState(exception, PostgresErrorTranslator.SQL_STATE_UNIQUE_VIOLATION)
-                    && PostgresErrorTranslator.mentionsConstraint(exception, CONSTRAINT_IDEMPOTENCY_PK)) {
+            if (PostgresErrorTranslator.isConstraintViolation(
+                    exception,
+                    PostgresErrorTranslator.SQL_STATE_UNIQUE_VIOLATION,
+                    CONSTRAINT_IDEMPOTENCY_PK
+            )) {
                 throw new DuplicateIdempotencyKeyException(accountId, idempotencyKey);
             }
             throw exception;

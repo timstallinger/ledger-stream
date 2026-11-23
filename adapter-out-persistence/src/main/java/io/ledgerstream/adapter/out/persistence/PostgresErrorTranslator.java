@@ -1,5 +1,7 @@
 package io.ledgerstream.adapter.out.persistence;
 
+import org.postgresql.util.PSQLException;
+import org.postgresql.util.ServerErrorMessage;
 import org.springframework.dao.DataIntegrityViolationException;
 
 import java.sql.SQLException;
@@ -12,24 +14,23 @@ final class PostgresErrorTranslator {
     private PostgresErrorTranslator() {
     }
 
-    static boolean isSqlState(final DataIntegrityViolationException exception, final String expectedSqlState) {
+    static boolean isConstraintViolation(
+            final DataIntegrityViolationException exception,
+            final String expectedSqlState,
+            final String expectedConstraintName
+    ) {
         Throwable current = exception;
         while (current != null) {
-            if (current instanceof SQLException sqlException
-                    && expectedSqlState.equals(sqlException.getSQLState())) {
-                return true;
+            if (current instanceof PSQLException psqlException
+                    && expectedSqlState.equals(psqlException.getSQLState())) {
+                ServerErrorMessage serverError = psqlException.getServerErrorMessage();
+                return serverError != null && expectedConstraintName.equals(serverError.getConstraint());
             }
-            current = current.getCause();
-        }
-        return false;
-    }
-
-    static boolean mentionsConstraint(final DataIntegrityViolationException exception, final String constraintName) {
-        Throwable current = exception;
-        while (current != null) {
-            String message = current.getMessage();
-            if (message != null && message.contains(constraintName)) {
-                return true;
+            if (current instanceof SQLException sqlException
+                    && expectedSqlState.equals(sqlException.getSQLState())
+                    && !(current instanceof PSQLException)) {
+                String message = sqlException.getMessage();
+                return message != null && message.contains(expectedConstraintName);
             }
             current = current.getCause();
         }
