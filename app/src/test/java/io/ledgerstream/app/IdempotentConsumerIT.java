@@ -3,10 +3,11 @@ package io.ledgerstream.app;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import io.confluent.kafka.serializers.KafkaAvroDeserializerConfig;
+import io.ledgerstream.adapter.in.messaging.LedgerConsumerMessage;
 import io.ledgerstream.adapter.in.messaging.LedgerEventRecordProcessor;
+import io.ledgerstream.adapter.in.messaging.RawPayloadPreservingAvroDeserializer;
 import io.ledgerstream.adapter.out.messaging.KafkaTopicProperties;
 import io.ledgerstream.adapter.out.messaging.avro.LedgerBookingEvent;
-import io.ledgerstream.app.config.KafkaConsumerConfiguration;
 import io.ledgerstream.application.port.out.AccountSummary;
 import io.ledgerstream.application.port.out.AccountSummaryRepository;
 import io.ledgerstream.domain.model.AccountId;
@@ -40,7 +41,6 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.support.serializer.ErrorHandlingDeserializer;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -197,9 +197,9 @@ final class IdempotentConsumerIT {
         double duplicatesBefore = rejectedCounter("duplicate");
 
         // Consumer 1: processes event & commits DB transaction, then crashes BEFORE committing Kafka offset
-        try (KafkaConsumer<String, Object> consumer1 = createManualAvroConsumer(groupId, 1)) {
+        try (KafkaConsumer<String, LedgerConsumerMessage> consumer1 = createManualAvroConsumer(groupId, 1)) {
             consumer1.subscribe(List.of(topic));
-            ConsumerRecord<String, Object> firstDelivery = pollSingleRecord(consumer1, Duration.ofSeconds(15));
+            ConsumerRecord<String, LedgerConsumerMessage> firstDelivery = pollSingleRecord(consumer1, Duration.ofSeconds(15));
             assertThat(firstDelivery).isNotNull();
 
             assertThatThrownBy(() -> recordProcessor.processRecord(firstDelivery, () -> {
@@ -217,9 +217,9 @@ final class IdempotentConsumerIT {
         assertThat(rejectedCounter("duplicate")).isEqualTo(duplicatesBefore);
 
         // Consumer 2 restarts in the EXACT SAME consumer group -> Kafka redelivers the uncommitted offset
-        try (KafkaConsumer<String, Object> consumer2 = createManualAvroConsumer(groupId, 1)) {
+        try (KafkaConsumer<String, LedgerConsumerMessage> consumer2 = createManualAvroConsumer(groupId, 1)) {
             consumer2.subscribe(List.of(topic));
-            ConsumerRecord<String, Object> redelivery = pollSingleRecord(consumer2, Duration.ofSeconds(15));
+            ConsumerRecord<String, LedgerConsumerMessage> redelivery = pollSingleRecord(consumer2, Duration.ofSeconds(15));
             assertThat(redelivery).isNotNull();
             assertThat(redelivery.offset()).isZero();
 
@@ -384,12 +384,12 @@ final class IdempotentConsumerIT {
         CountDownLatch triggerRebalance = new CountDownLatch(4);
 
         Runnable consumerLoop = () -> {
-            try (KafkaConsumer<String, Object> consumer = createManualAvroConsumer(groupId, 2)) {
+            try (KafkaConsumer<String, LedgerConsumerMessage> consumer = createManualAvroConsumer(groupId, 2)) {
                 consumer.subscribe(List.of(topic));
                 consumer1Started.countDown();
                 while (!stop.get()) {
-                    ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(200));
-                    for (ConsumerRecord<String, Object> record : records) {
+                    ConsumerRecords<String, LedgerConsumerMessage> records = consumer.poll(Duration.ofMillis(200));
+                    for (ConsumerRecord<String, LedgerConsumerMessage> record : records) {
                         var outcome = recordProcessor.processRecord(record, () -> consumer.commitSync(Map.of(
                                 new TopicPartition(record.topic(), record.partition()),
                                 new OffsetAndMetadata(record.offset() + 1)
@@ -438,11 +438,11 @@ final class IdempotentConsumerIT {
     ) {
         int processed = 0;
         Instant deadline = Instant.now().plus(Duration.ofSeconds(20));
-        try (KafkaConsumer<String, Object> consumer = createManualAvroConsumer(groupId, 10)) {
+        try (KafkaConsumer<String, LedgerConsumerMessage> consumer = createManualAvroConsumer(groupId, 10)) {
             consumer.subscribe(List.of(topic));
             while (Instant.now().isBefore(deadline) && processed < expectedCount) {
-                ConsumerRecords<String, Object> records = consumer.poll(Duration.ofMillis(250));
-                for (ConsumerRecord<String, Object> record : records) {
+                ConsumerRecords<String, LedgerConsumerMessage> records = consumer.poll(Duration.ofMillis(250));
+                for (ConsumerRecord<String, LedgerConsumerMessage> record : records) {
                     recordProcessor.processRecord(record, () -> consumer.commitSync(Map.of(
                             new TopicPartition(record.topic(), record.partition()),
                             new OffsetAndMetadata(record.offset() + 1)
@@ -454,7 +454,10 @@ final class IdempotentConsumerIT {
         assertThat(processed).isEqualTo(expectedCount);
     }
 
-    private KafkaConsumer<String, Object> createManualAvroConsumer(final String groupId, final int maxPollRecords) {
+    private KafkaConsumer<String, LedgerConsumerMessage> createManualAvroConsumer(
+            final String groupId,
+            final int maxPollRecords
+    ) {
         Map<String, Object> props = new HashMap<>();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
@@ -466,21 +469,18 @@ final class IdempotentConsumerIT {
 
         KafkaAvroDeserializer avroDelegate = new KafkaAvroDeserializer();
         avroDelegate.configure(props, false);
-        ErrorHandlingDeserializer<Object> valueDeserializer = new ErrorHandlingDeserializer<>(avroDelegate);
-        valueDeserializer.setFailedDeserializationFunction(info -> new KafkaConsumerConfiguration.DeserializationFailureMarker(
-                info.getTopic(),
-                info.getException() != null ? info.getException().getMessage() : "deserialization failed"
-        ));
+        RawPayloadPreservingAvroDeserializer valueDeserializer =
+                new RawPayloadPreservingAvroDeserializer(avroDelegate);
         return new KafkaConsumer<>(props, new StringDeserializer(), valueDeserializer);
     }
 
-    private ConsumerRecord<String, Object> pollSingleRecord(
-            final KafkaConsumer<String, Object> consumer,
+    private ConsumerRecord<String, LedgerConsumerMessage> pollSingleRecord(
+            final KafkaConsumer<String, LedgerConsumerMessage> consumer,
             final Duration timeout
     ) {
         Instant deadline = Instant.now().plus(timeout);
         while (Instant.now().isBefore(deadline)) {
-            ConsumerRecords<String, Object> batch = consumer.poll(Duration.ofMillis(250));
+            ConsumerRecords<String, LedgerConsumerMessage> batch = consumer.poll(Duration.ofMillis(250));
             if (!batch.isEmpty()) {
                 return batch.iterator().next();
             }

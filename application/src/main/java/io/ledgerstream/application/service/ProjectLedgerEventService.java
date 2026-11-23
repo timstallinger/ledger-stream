@@ -2,6 +2,7 @@ package io.ledgerstream.application.service;
 
 import io.ledgerstream.application.port.in.EventProcessingOutcome;
 import io.ledgerstream.application.port.in.IncomingLedgerEvent;
+import io.ledgerstream.application.port.in.NonRetryableEventException;
 import io.ledgerstream.application.port.in.ProjectLedgerEventUseCase;
 import io.ledgerstream.application.port.out.AccountRepository;
 import io.ledgerstream.application.port.out.AccountSummaryRepository;
@@ -56,36 +57,42 @@ public final class ProjectLedgerEventService implements ProjectLedgerEventUseCas
         if (event == null || event.eventId() == null || event.aggregateId() == null || event.eventType() == null) {
             String key = event != null && event.eventId() != null ? event.eventId().toString() : "unknown";
             observer.onPoisonRejected(key, "missing_required_identifiers");
-            return EventProcessingOutcome.POISON_REJECTED;
+            throw new NonRetryableEventException("missing_required_identifiers", "Missing required event identifiers");
         }
 
         if (event.amount() == null || event.amount().compareTo(BigDecimal.ZERO) <= 0) {
             observer.onPoisonRejected(event.eventId().toString(), "non_positive_amount");
-            return EventProcessingOutcome.POISON_REJECTED;
+            throw new NonRetryableEventException("non_positive_amount", "Booking amount must be > 0: " + event.amount());
         }
 
         BookingType bookingType = parseBookingType(event.bookingType());
         if (bookingType == null) {
             observer.onPoisonRejected(event.eventId().toString(), "invalid_booking_type");
-            return EventProcessingOutcome.POISON_REJECTED;
+            throw new NonRetryableEventException("invalid_booking_type", "Unsupported bookingType: " + event.bookingType());
         }
 
         if (EVENT_TYPE_CANCELLED.equals(event.eventType()) && event.originalBookingId() == null) {
             observer.onPoisonRejected(event.eventId().toString(), "missing_original_booking_id");
-            return EventProcessingOutcome.POISON_REJECTED;
+            throw new NonRetryableEventException(
+                    "missing_original_booking_id",
+                    "BookingCancelled event is missing originalBookingId"
+            );
         }
 
         AccountId accountId = AccountId.of(event.aggregateId());
         Optional<Account> accountOptional = accountRepository.findById(accountId);
         if (accountOptional.isEmpty()) {
             observer.onPoisonRejected(event.eventId().toString(), "unknown_account");
-            return EventProcessingOutcome.POISON_REJECTED;
+            throw new NonRetryableEventException("unknown_account", "Unknown accountId in event: " + event.aggregateId());
         }
 
         Account account = accountOptional.get();
         if (event.currency() == null || !account.balance().currency().value().equalsIgnoreCase(event.currency())) {
             observer.onPoisonRejected(event.eventId().toString(), "currency_mismatch");
-            return EventProcessingOutcome.POISON_REJECTED;
+            throw new NonRetryableEventException(
+                    "currency_mismatch",
+                    "Currency mismatch for account " + event.aggregateId() + ": " + event.currency()
+            );
         }
 
         Instant now = clock.instant();

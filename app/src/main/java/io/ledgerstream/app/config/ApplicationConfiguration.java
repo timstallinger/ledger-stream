@@ -3,8 +3,10 @@ package io.ledgerstream.app.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.ledgerstream.adapter.in.rest.AccountController;
 import io.ledgerstream.adapter.in.rest.BookingController;
+import io.ledgerstream.adapter.in.rest.DlqAdminController;
 import io.ledgerstream.adapter.in.rest.ProblemDetailExceptionHandler;
 import io.ledgerstream.adapter.out.messaging.KafkaOutboxEventPublisher;
+import io.ledgerstream.adapter.out.messaging.KafkaRawEventPublisher;
 import io.ledgerstream.adapter.out.messaging.KafkaTopicProperties;
 import io.ledgerstream.adapter.out.messaging.OutboxRelayProperties;
 import io.ledgerstream.adapter.out.messaging.OutboxRelayScheduler;
@@ -13,30 +15,38 @@ import io.ledgerstream.adapter.out.persistence.JacksonOutboxPayloadSerializer;
 import io.ledgerstream.adapter.out.persistence.JdbcAccountRepository;
 import io.ledgerstream.adapter.out.persistence.JdbcAccountSummaryRepository;
 import io.ledgerstream.adapter.out.persistence.JdbcBookingRepository;
+import io.ledgerstream.adapter.out.persistence.JdbcDlqRepository;
 import io.ledgerstream.adapter.out.persistence.JdbcIdempotencyStore;
 import io.ledgerstream.adapter.out.persistence.JdbcOutboxRepository;
 import io.ledgerstream.adapter.out.persistence.JdbcProcessedEventRepository;
 import io.ledgerstream.adapter.out.persistence.SpringTransactionRunner;
+import io.ledgerstream.application.port.in.ListDlqUseCase;
 import io.ledgerstream.application.port.in.RelayOutboxUseCase;
+import io.ledgerstream.application.port.in.ReplayDlqUseCase;
 import io.ledgerstream.application.port.out.AccountRepository;
 import io.ledgerstream.application.port.out.AccountSummaryRepository;
 import io.ledgerstream.application.port.out.BookingRepository;
 import io.ledgerstream.application.port.out.ConsumerEventObserver;
+import io.ledgerstream.application.port.out.DlqObserver;
+import io.ledgerstream.application.port.out.DlqRepository;
 import io.ledgerstream.application.port.out.IdempotencyStore;
 import io.ledgerstream.application.port.out.OutboxEventPublisher;
 import io.ledgerstream.application.port.out.OutboxPayloadSerializer;
 import io.ledgerstream.application.port.out.OutboxRelayObserver;
 import io.ledgerstream.application.port.out.OutboxRepository;
 import io.ledgerstream.application.port.out.ProcessedEventRepository;
+import io.ledgerstream.application.port.out.RawEventPublisher;
 import io.ledgerstream.application.port.out.TransactionRunner;
 import io.ledgerstream.application.service.AccountService;
 import io.ledgerstream.application.service.BookingService;
+import io.ledgerstream.application.service.DlqReplayService;
 import io.ledgerstream.application.service.OutboxRelayService;
 import io.ledgerstream.application.service.OutboxRetryBackoff;
 import io.ledgerstream.application.service.ProjectLedgerEventService;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -98,6 +108,45 @@ public class ApplicationConfiguration {
     @Bean
     public AccountSummaryRepository accountSummaryRepository(final JdbcClient jdbcClient) {
         return new JdbcAccountSummaryRepository(jdbcClient);
+    }
+
+    @Bean
+    public DlqRepository dlqRepository(final JdbcClient jdbcClient, final ObjectMapper objectMapper) {
+        return new JdbcDlqRepository(jdbcClient, objectMapper);
+    }
+
+    @Bean
+    public DlqObserver dlqObserver(final MeterRegistry meterRegistry) {
+        return new ObservabilityDlqObserver(meterRegistry);
+    }
+
+    @Bean
+    public RawEventPublisher rawEventPublisher(
+            @Qualifier("rawBytesReplayKafkaTemplate") final KafkaTemplate<String, byte[]> rawBytesReplayKafkaTemplate,
+            final OutboxRelayProperties relayProperties
+    ) {
+        return new KafkaRawEventPublisher(rawBytesReplayKafkaTemplate, relayProperties.publishTimeoutMs());
+    }
+
+    @Bean
+    public DlqReplayService dlqReplayService(
+            final DlqRepository dlqRepository,
+            final RawEventPublisher rawEventPublisher,
+            final DlqObserver dlqObserver,
+            final TransactionRunner transactionRunner,
+            final Clock clock
+    ) {
+        return new DlqReplayService(dlqRepository, rawEventPublisher, dlqObserver, transactionRunner, clock);
+    }
+
+    @Bean
+    public Gauge dlqEntriesUnhandledGauge(
+            final DlqRepository dlqRepository,
+            final MeterRegistry meterRegistry
+    ) {
+        return Gauge.builder("dlq_entries_unhandled", dlqRepository, DlqRepository::countUnhandled)
+                .description("Number of unhandled DLQ entries awaiting inspection or replay")
+                .register(meterRegistry);
     }
 
     @Bean
@@ -254,6 +303,19 @@ public class ApplicationConfiguration {
         @Bean
         public OutboxRelayScheduler outboxRelayScheduler(final RelayOutboxUseCase relayOutboxUseCase) {
             return new OutboxRelayScheduler(relayOutboxUseCase);
+        }
+    }
+
+    @Configuration
+    @ConditionalOnProperty(name = "ledger.admin.enabled", havingValue = "true", matchIfMissing = false)
+    static class AdminEndpointsConfiguration {
+
+        @Bean
+        public DlqAdminController dlqAdminController(
+                final ListDlqUseCase listDlqUseCase,
+                final ReplayDlqUseCase replayDlqUseCase
+        ) {
+            return new DlqAdminController(listDlqUseCase, replayDlqUseCase);
         }
     }
 }

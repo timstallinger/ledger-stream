@@ -27,11 +27,14 @@ spring:
       auto-offset-reset: earliest
       properties:
         schema.registry.url: ${SCHEMA_REGISTRY_URL:http://localhost:8081}
+        max.poll.interval.ms: 300000
 
 server:
   port: ${SERVER_PORT:8080}
 
 ledger:
+  admin:
+    enabled: ${LEDGER_ADMIN_ENABLED:false}
   kafka:
     topics:
       ledger-events: ${LEDGER_EVENTS_TOPIC:ledger.events}
@@ -40,6 +43,10 @@ ledger:
       enabled: ${KAFKA_CONSUMER_ENABLED:true}
       group-id: ${KAFKA_CONSUMER_GROUP_ID:ledger-stream-projection}
       concurrency: ${KAFKA_CONSUMER_CONCURRENCY:1}
+    retry:
+      max-attempts: ${KAFKA_RETRY_MAX_ATTEMPTS:5}
+      initial-delay-ms: ${KAFKA_RETRY_INITIAL_DELAY_MS:1000}
+      max-delay-ms: ${KAFKA_RETRY_MAX_DELAY_MS:30000}
   outbox:
     relay:
       enabled: ${OUTBOX_RELAY_ENABLED:true}

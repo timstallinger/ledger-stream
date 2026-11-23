@@ -9,4 +9,7 @@ public interface ConsumerEventObserver {
     void onDuplicateRejected(UUID eventId);
 
     void onPoisonRejected(String eventIdOrKey, String reason);
+
+    default void onRetryAttempt(String topic, int attemptNumber, String errorClass) {
+    }
 }

@@ -3,6 +3,8 @@ package io.ledgerstream.adapter.in.rest;
 import io.ledgerstream.domain.DomainException;
 import io.ledgerstream.domain.exception.AccountNotFoundException;
 import io.ledgerstream.domain.exception.BookingNotFoundException;
+import io.ledgerstream.domain.exception.DlqEntryAlreadyReplayedException;
+import io.ledgerstream.domain.exception.DlqEntryNotFoundException;
 import io.ledgerstream.domain.exception.DuplicateAccountNumberException;
 import io.ledgerstream.domain.exception.InvalidDomainValueException;
 import io.ledgerstream.domain.exception.LockTimeoutException;
@@ -38,7 +40,11 @@ public final class ProblemDetailExceptionHandler {
         return buildProblem(HttpStatus.BAD_REQUEST, "Invalid input", exception.errorCode(), exception.getMessage(), request);
     }
 
-    @ExceptionHandler({AccountNotFoundException.class, BookingNotFoundException.class})
+    @ExceptionHandler({
+            AccountNotFoundException.class,
+            BookingNotFoundException.class,
+            DlqEntryNotFoundException.class
+    })
     public ProblemDetail handleNotFound(
             final DomainException exception,
             final HttpServletRequest request
@@ -46,7 +52,11 @@ public final class ProblemDetailExceptionHandler {
         return buildProblem(HttpStatus.NOT_FOUND, "Resource not found", exception.errorCode(), exception.getMessage(), request);
     }
 
-    @ExceptionHandler({DuplicateAccountNumberException.class, OptimisticLockConflictException.class})
+    @ExceptionHandler({
+            DuplicateAccountNumberException.class,
+            OptimisticLockConflictException.class,
+            DlqEntryAlreadyReplayedException.class
+    })
     public ProblemDetail handleConflict(
             final DomainException exception,
             final HttpServletRequest request

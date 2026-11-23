@@ -2,6 +2,7 @@ package io.ledgerstream.application.service;
 
 import io.ledgerstream.application.port.in.EventProcessingOutcome;
 import io.ledgerstream.application.port.in.IncomingLedgerEvent;
+import io.ledgerstream.application.port.in.NonRetryableEventException;
 import io.ledgerstream.application.port.out.AccountRepository;
 import io.ledgerstream.application.port.out.AccountSummary;
 import io.ledgerstream.application.port.out.AccountSummaryRepository;
@@ -31,6 +32,7 @@ import java.util.UUID;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 final class ProjectLedgerEventServiceTest {
 
@@ -201,9 +203,12 @@ final class ProjectLedgerEventServiceTest {
                 "DEBIT", new BigDecimal("-5.00"), "EUR", "Neg", 1L, T0, 1
         );
 
-        assertThat(service.process(unknownAccountEvent)).isEqualTo(EventProcessingOutcome.POISON_REJECTED);
-        assertThat(service.process(zeroAmountEvent)).isEqualTo(EventProcessingOutcome.POISON_REJECTED);
-        assertThat(service.process(negativeAmountEvent)).isEqualTo(EventProcessingOutcome.POISON_REJECTED);
+        assertThatThrownBy(() -> service.process(unknownAccountEvent))
+                .isInstanceOf(NonRetryableEventException.class);
+        assertThatThrownBy(() -> service.process(zeroAmountEvent))
+                .isInstanceOf(NonRetryableEventException.class);
+        assertThatThrownBy(() -> service.process(negativeAmountEvent))
+                .isInstanceOf(NonRetryableEventException.class);
         assertThat(poisonReasons).containsExactly("unknown_account", "non_positive_amount", "non_positive_amount");
         assertThat(summaries).isEmpty();
         assertThat(processedEventIds).isEmpty();
