@@ -18,8 +18,8 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    mem_limit: 256m
-    cpus: 0.25
+    mem_limit: 192m
+    cpus: 0.20
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ledger} -d ${POSTGRES_DB:-ledger}"]
       interval: 5s
@@ -28,7 +28,7 @@ services:
       start_period: 5s
 
   kafka:
-    image: apache/kafka:3.9.0
+    image: apache/kafka:3.9.1
     container_name: ledger-stream-kafka
     environment:
       KAFKA_NODE_ID: 1
@@ -44,18 +44,21 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_LOG_CLEANER_DEDUPE_BUFFER_SIZE: "16777216"
+      KAFKA_LOG_CLEANER_IO_BUFFER_SIZE: "524288"
       KAFKA_HEAP_OPTS: "-Xms160m -Xmx224m"
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
     ports:
       - "${KAFKA_PORT:-9092}:9092"
     volumes:
-      - kafka_data:/tmp/kraft-combined-logs
-    mem_limit: 384m
+      - kafka_data:/var/lib/kafka/data
+    mem_limit: 352m
     cpus: 0.35
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/29092'"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 20
       start_period: 15s
 
@@ -71,11 +74,11 @@ services:
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
       SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
       SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: BACKWARD
-      SCHEMA_REGISTRY_HEAP_OPTS: "-Xms80m -Xmx112m"
+      SCHEMA_REGISTRY_HEAP_OPTS: "-Xms96m -Xmx128m"
     ports:
       - "${SCHEMA_REGISTRY_PORT:-8081}:8081"
-    mem_limit: 160m
-    cpus: 0.15
+    mem_limit: 224m
+    cpus: 0.20
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects > /dev/null || exit 1"]
       interval: 5s

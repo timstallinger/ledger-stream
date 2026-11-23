@@ -34,7 +34,7 @@ final class ApplicationSmokeIT {
     @Container
     @ServiceConnection
     static final KafkaContainer KAFKA =
-            new KafkaContainer(DockerImageName.parse("apache/kafka:3.9.0"));
+            new KafkaContainer(DockerImageName.parse("apache/kafka:3.9.1"));
 
     @Autowired
     private TestRestTemplate restTemplate;
