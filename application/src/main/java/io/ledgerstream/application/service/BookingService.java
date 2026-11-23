@@ -12,6 +12,9 @@ import io.ledgerstream.application.port.out.AccountRepository;
 import io.ledgerstream.application.port.out.BookingRepository;
 import io.ledgerstream.application.port.out.DuplicateIdempotencyKeyException;
 import io.ledgerstream.application.port.out.IdempotencyStore;
+import io.ledgerstream.application.port.out.OutboxEvent;
+import io.ledgerstream.application.port.out.OutboxPayloadSerializer;
+import io.ledgerstream.application.port.out.OutboxRepository;
 import io.ledgerstream.application.port.out.TransactionRunner;
 import io.ledgerstream.domain.event.BookingCancelledEvent;
 import io.ledgerstream.domain.event.BookingCreatedEvent;
@@ -38,6 +41,8 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
     private final AccountRepository accountRepository;
     private final BookingRepository bookingRepository;
     private final IdempotencyStore idempotencyStore;
+    private final OutboxRepository outboxRepository;
+    private final OutboxPayloadSerializer outboxPayloadSerializer;
     private final TransactionRunner transactionRunner;
     private final Clock clock;
 
@@ -45,12 +50,19 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
             final AccountRepository accountRepository,
             final BookingRepository bookingRepository,
             final IdempotencyStore idempotencyStore,
+            final OutboxRepository outboxRepository,
+            final OutboxPayloadSerializer outboxPayloadSerializer,
             final TransactionRunner transactionRunner,
             final Clock clock
     ) {
         this.accountRepository = Objects.requireNonNull(accountRepository, "accountRepository must not be null");
         this.bookingRepository = Objects.requireNonNull(bookingRepository, "bookingRepository must not be null");
         this.idempotencyStore = Objects.requireNonNull(idempotencyStore, "idempotencyStore must not be null");
+        this.outboxRepository = Objects.requireNonNull(outboxRepository, "outboxRepository must not be null");
+        this.outboxPayloadSerializer = Objects.requireNonNull(
+                outboxPayloadSerializer,
+                "outboxPayloadSerializer must not be null"
+        );
         this.transactionRunner = Objects.requireNonNull(transactionRunner, "transactionRunner must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
     }
@@ -145,6 +157,9 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
                 updatedAccount.version(),
                 now
         );
+        String serializedPayload = outboxPayloadSerializer.serialize(event);
+        outboxRepository.save(OutboxEvent.pending(event, serializedPayload, null, now));
+
         StoredIdempotentResponse storedResponse = responseSerializer.apply(
                 new BookingExecution(booking, updatedAccount, event)
         );
@@ -189,6 +204,9 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
                 updatedAccount.version(),
                 now
         );
+        String serializedPayload = outboxPayloadSerializer.serialize(event);
+        outboxRepository.save(OutboxEvent.pending(event, serializedPayload, null, now));
+
         StoredIdempotentResponse storedResponse = responseSerializer.apply(
                 new BookingExecution(pair.counterBooking(), updatedAccount, event)
         );
