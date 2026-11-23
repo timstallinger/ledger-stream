@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledger-stream-config
+data:
+  LEDGER_ADMIN_ENABLED: "false"
+  SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: "FULL"
+  LEDGER_EVENTS_TOPIC: "ledger.events"
+  LEDGER_EVENTS_DLQ_TOPIC: "ledger.events.dlq"
+  OUTBOX_RELAY_BATCH_SIZE: "500"
+  OUTBOX_RELAY_MAX_ATTEMPTS: "10"
+  KAFKA_RETRY_MAX_ATTEMPTS: "5"

@@ -34,6 +34,96 @@ public final class JdbcDlqRepository implements DlqRepository {
 
     @Override
     public void save(final DlqEntry entry) {
+        String headersJson = serializeHeaders(entry.headers());
+
+        // If an event_id already has a DLQ entry (either open or previously replayed and now failing again),
+        // update/reopen that single entry and increment attempt_count instead of creating a second open row.
+        if (entry.eventId() != null) {
+            Optional<UUID> existingId = jdbcClient.sql("""
+                            SELECT id
+                            FROM dlq_entries
+                            WHERE event_id = :eventId
+                            ORDER BY (replayed_at IS NULL) DESC, created_at DESC
+                            LIMIT 1
+                            FOR UPDATE
+                            """)
+                    .param("eventId", entry.eventId())
+                    .query(UUID.class)
+                    .optional();
+
+            if (existingId.isPresent()) {
+                jdbcClient.sql("""
+                                UPDATE dlq_entries
+                                SET topic = :topic,
+                                    partition = :partition,
+                                    "offset" = :offset,
+                                    record_key = COALESCE(:recordKey, record_key),
+                                    error_class = :errorClass,
+                                    error_message = :errorMessage,
+                                    attempt_count = attempt_count + :additionalAttempts,
+                                    payload = :payload,
+                                    headers = CAST(:headers AS jsonb),
+                                    replayed_at = NULL
+                                WHERE id = :id
+                                """)
+                        .param("topic", entry.topic())
+                        .param("partition", entry.partition())
+                        .param("offset", entry.offset())
+                        .param("recordKey", entry.recordKey())
+                        .param("errorClass", entry.errorClass())
+                        .param("errorMessage", entry.errorMessage())
+                        .param("additionalAttempts", entry.attemptCount())
+                        .param("payload", entry.payload())
+                        .param("headers", headersJson)
+                        .param("id", existingId.get())
+                        .update();
+                return;
+            }
+
+            jdbcClient.sql("""
+                            INSERT INTO dlq_entries (
+                                id, topic, partition, "offset", record_key, event_id,
+                                error_class, error_message, attempt_count, payload, headers,
+                                created_at, replayed_at, replayed_by, note
+                            )
+                            VALUES (
+                                :id, :topic, :partition, :offset, :recordKey, :eventId,
+                                :errorClass, :errorMessage, :attemptCount, :payload, CAST(:headers AS jsonb),
+                                :createdAt, :replayedAt, :replayedBy, :note
+                            )
+                            ON CONFLICT (event_id) WHERE event_id IS NOT NULL AND replayed_at IS NULL
+                            DO UPDATE SET
+                                topic = EXCLUDED.topic,
+                                partition = EXCLUDED.partition,
+                                "offset" = EXCLUDED."offset",
+                                record_key = COALESCE(EXCLUDED.record_key, dlq_entries.record_key),
+                                error_class = EXCLUDED.error_class,
+                                error_message = EXCLUDED.error_message,
+                                attempt_count = dlq_entries.attempt_count + EXCLUDED.attempt_count,
+                                payload = EXCLUDED.payload,
+                                headers = EXCLUDED.headers
+                            """)
+                    .param("id", entry.id())
+                    .param("topic", entry.topic())
+                    .param("partition", entry.partition())
+                    .param("offset", entry.offset())
+                    .param("recordKey", entry.recordKey())
+                    .param("eventId", entry.eventId())
+                    .param("errorClass", entry.errorClass())
+                    .param("errorMessage", entry.errorMessage())
+                    .param("attemptCount", entry.attemptCount())
+                    .param("payload", entry.payload())
+                    .param("headers", headersJson)
+                    .param("createdAt", OffsetDateTime.ofInstant(entry.createdAt(), ZoneOffset.UTC))
+                    .param("replayedAt", entry.replayedAt() != null
+                            ? OffsetDateTime.ofInstant(entry.replayedAt(), ZoneOffset.UTC)
+                            : null)
+                    .param("replayedBy", entry.replayedBy())
+                    .param("note", entry.note())
+                    .update();
+            return;
+        }
+
         jdbcClient.sql("""
                         INSERT INTO dlq_entries (
                             id, topic, partition, "offset", record_key, event_id,
@@ -41,7 +131,7 @@ public final class JdbcDlqRepository implements DlqRepository {
                             created_at, replayed_at, replayed_by, note
                         )
                         VALUES (
-                            :id, :topic, :partition, :offset, :recordKey, :eventId,
+                            :id, :topic, :partition, :offset, :recordKey, NULL,
                             :errorClass, :errorMessage, :attemptCount, :payload, CAST(:headers AS jsonb),
                             :createdAt, :replayedAt, :replayedBy, :note
                         )
@@ -51,12 +141,11 @@ public final class JdbcDlqRepository implements DlqRepository {
                 .param("partition", entry.partition())
                 .param("offset", entry.offset())
                 .param("recordKey", entry.recordKey())
-                .param("eventId", entry.eventId())
                 .param("errorClass", entry.errorClass())
                 .param("errorMessage", entry.errorMessage())
                 .param("attemptCount", entry.attemptCount())
                 .param("payload", entry.payload())
-                .param("headers", serializeHeaders(entry.headers()))
+                .param("headers", headersJson)
                 .param("createdAt", OffsetDateTime.ofInstant(entry.createdAt(), ZoneOffset.UTC))
                 .param("replayedAt", entry.replayedAt() != null
                         ? OffsetDateTime.ofInstant(entry.replayedAt(), ZoneOffset.UTC)
