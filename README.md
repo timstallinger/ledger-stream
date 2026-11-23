@@ -25,7 +25,10 @@ flowchart LR
     KPROD["adapter-out-messaging<br/>(Outbox Relay + Avro)"] --> APP
 ```
 
-Architekturentscheidungen werden als ADRs unter [`docs/adr/`](docs/adr/) gepflegt (u. a. [ADR-0001: Spring `JdbcClient` statt JPA/Hibernate](docs/adr/0001-jdbcclient-statt-jpa.md)).
+Architekturentscheidungen werden als ADRs unter [`docs/adr/`](docs/adr/) gepflegt:
+- [ADR-0001: Spring `JdbcClient` statt JPA/Hibernate](docs/adr/0001-jdbcclient-statt-jpa.md)
+- [ADR-0002: Avro-Kompatibilität `FULL` statt `BACKWARD`](docs/adr/0002-avro-full-compatibility-statt-backward.md)
+- Bewusste Entwurfsgrenzen (u. a. Per-Account-Reihenfolge bei Non-Blocking Retry-Topics): [docs/design-decisions.md](docs/design-decisions.md)
 
 ## Idempotenz-Semantik (HTTP-API)
 
@@ -83,8 +86,15 @@ lock_timeout         = 3s
   - `dlq_entries_unhandled` (Gauge): offene DLQ-Einträge (`replayed_at IS NULL`) — Zielwert `0`, maßgeblich für Alarmierung.
   - `dlq_replayed_total` (Counter): über `POST /admin/dlq/{id}/replay` erneut eingestellte Einträge.
   - `consumer_retries_total` (Counter): ausgelöste nicht-blockierende Retry-Versuche (Frühindikator vor DLQ-Wachstum).
-- **Offener Sicherheitspunkt (wird in Phase 7 geschlossen):** `POST /admin/dlq/{id}/replay` und `GET /admin/dlq` sind über `ledger.admin.enabled=false` standardmäßig abgeschaltet (liefern `404`), bis in Phase 7 Keycloak 26 + OIDC und die Rolle `operator` verdrahtet sind.
+- **Offener Sicherheitspunkt (wird in Phase 7 geschlossen):** `POST /admin/dlq/{id}/replay` und `GET /admin/dlq` sind über `ledger.admin.enabled=false` standardmäßig abgeschaltet (liefern `404`), bis in Phase 7 Keycloak 26 + OIDC und die Rolle `operator` verdrahtet sind. Im k3s-Kustomize-Overlay ([deploy/kustomize/overlays/prod/kustomization.yaml](deploy/kustomize/overlays/prod/kustomization.yaml)) ist `LEDGER_ADMIN_ENABLED=false` zusätzlich explizit gepinnt.
+- **Zwei unabhängige Replay-Garantien:** Ein erneuter Replay eines bereits wieder eingespielten DLQ-Eintrags wird bereits an der Admin-API über den `replayed_at`-Guard mit HTTP **`409 Conflict`** abgewiesen; selbst bei einem manuellen Re-Publish am Admin-Endpunkt vorbei verhindert `UNIQUE (event_id)` auf `processed_events` eine doppelte Buchungswirkung. Scheitert ein Replay erneut, öffnet der Partial-Unique-Index `uq_dlq_entries_unhandled_event_id` den bestehenden Eintrag wieder und erhöht `attempt_count`, statt eine zweite offene Zeile anzulegen.
 - Vollständiges Runbook (Analyse, Replay-Kriterien, Begründung Outbox `10` vs. Consumer `5` Retries): [docs/operations.md](docs/operations.md).
+
+## Schema-Evolution (Avro + Confluent Schema Registry)
+
+- **Kompatibilitätsstufe:** `FULL` (beidseitig: v2-Consumer liest v1-Daten **und** v1-Consumer liest v2-Daten; Begründung gegenüber `BACKWARD` und `FULL_TRANSITIVE` in [ADR-0002](docs/adr/0002-avro-full-compatibility-statt-backward.md)).
+- **Evolution v1 → v2 (`LedgerBookingEvent.avsc`):** Neues optionales Feld `initiationChannel` (`"type": "string", "default": "API"`). Beim Lesen älterer v1-Nachrichten löst der Consumer den nicht-null Default `"API"` auf; `schemaVersion = 2` im Payload korrespondiert mit der v2-Schema-ID im 5-Byte Confluent-Wire-Header.
+- **CI-Erzwingung:** `SchemaEvolutionIT` prüft im CI-Build gegen eine echte Schema Registry (`confluentinc/cp-schema-registry:7.9.9`) die `FULL`-Konfiguration, beide Leserichtungen, die Ablehnung eines inkompatiblen Schemas (Pflichtfeld ohne Default → HTTP `409`) sowie byte-gleiche Rohbytes bei DLQ-Replay von v2-Events. Der CI-Workflow bricht ab, falls `SchemaEvolutionIT` nicht mit 0 Skips läuft.
 
 ## Schnellstart
 

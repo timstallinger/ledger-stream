@@ -43,3 +43,22 @@ jobs:
             echo "ERROR: Expected at least 1 integration test to execute."
             exit 1
           fi
+
+      - name: Verify Schema Evolution & Compatibility Check IT executed
+        run: |
+          REPORT="app/target/failsafe-reports/TEST-io.ledgerstream.app.SchemaEvolutionIT.xml"
+          if [ ! -f "$REPORT" ]; then
+            echo "ERROR: Missing $REPORT — Schema compatibility check did not run!"
+            exit 1
+          fi
+          HEADER=$(grep -m1 '<testsuite ' "$REPORT")
+          echo "SchemaEvolutionIT report: $HEADER"
+          TESTS=$(echo "$HEADER" | sed -n 's/.*tests="\([0-9]*\)".*/\1/p')
+          SKIPPED=$(echo "$HEADER" | sed -n 's/.*skipped="\([0-9]*\)".*/\1/p')
+          ERRORS=$(echo "$HEADER" | sed -n 's/.*errors="\([0-9]*\)".*/\1/p')
+          FAILURES=$(echo "$HEADER" | sed -n 's/.*failures="\([0-9]*\)".*/\1/p')
+          echo "SchemaEvolutionIT: tests=${TESTS}, skipped=${SKIPPED}, errors=${ERRORS}, failures=${FAILURES}"
+          if [ -z "$TESTS" ] || [ "$TESTS" -lt 4 ] || [ "${SKIPPED:-1}" -ne 0 ] || [ "${ERRORS:-1}" -ne 0 ] || [ "${FAILURES:-1}" -ne 0 ]; then
+            echo "ERROR: SchemaEvolutionIT compatibility checks did not execute cleanly!"
+            exit 1
+          fi
