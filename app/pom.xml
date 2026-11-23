@@ -28,6 +28,10 @@
         </dependency>
         <dependency>
             <groupId>io.ledgerstream</groupId>
+            <artifactId>adapter-in-messaging</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.ledgerstream</groupId>
             <artifactId>adapter-out-persistence</artifactId>
         </dependency>
         <dependency>

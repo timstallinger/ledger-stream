@@ -40,7 +40,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "ledger.outbox.relay.enabled=false"
+        properties = {
+                "ledger.outbox.relay.enabled=false",
+                "ledger.kafka.consumer.enabled=false"
+        }
 )
 @Testcontainers
 final class AccountBookingApiIT {

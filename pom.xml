@@ -23,6 +23,7 @@
         <module>domain</module>
         <module>application</module>
         <module>adapter-in-rest</module>
+        <module>adapter-in-messaging</module>
         <module>adapter-out-persistence</module>
         <module>adapter-out-messaging</module>
         <module>app</module>
@@ -66,6 +67,11 @@
             <dependency>
                 <groupId>io.ledgerstream</groupId>
                 <artifactId>adapter-in-rest</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.ledgerstream</groupId>
+                <artifactId>adapter-in-messaging</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
