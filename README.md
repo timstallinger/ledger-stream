@@ -114,21 +114,35 @@ lock_timeout         = 3s
 
 ### Durchsetzung & Härtung
 
-- **404-vor-401:** Ist `ledger.admin.enabled=false` (Default), nimmt eine `@Order(1)`-`SecurityFilterChain` den Pfad `/admin/**` vor der OIDC-Prüfung heraus; ohne `DlqAdminController` antwortet Spring konsistent mit **`404 Not Found`** (unauthentifiziert, als `viewer` und als `operator`), ohne die Existenz der Admin-Route zu verraten.
-- **Explizite Token-Prüfung:** `JwtAuthenticationConverter` mappt `realm_access.roles` explizit auf `ROLE_*`. Der `NimbusJwtDecoder` prüft Signatur über JWKS (kein `alg=none`, kein fremder Key), `exp`/`nbf`, `iss` sowie explizit `aud = ledger-stream-api`. `401` und `403` liefern strukturierte RFC-7807-Antworten (`application/problem+json`).
-- **Keine Secrets im Repository:** [keycloak/realm-export.json](keycloak/realm-export.json) enthält den Public-PKCE-Client `ledger-stream-spa` (`S256`, ohne Secret) für Phase 8 sowie den vertraulichen Client `ledger-stream-cli` mit Platzhalter `${LEDGER_CLI_CLIENT_SECRET}` (Injektion per Env / Kubernetes `secretKeyRef` in [deploy/kustomize/base/keycloak-deployment.yaml](deploy/kustomize/base/keycloak-deployment.yaml)).
+- **404-vor-401-Invariante:** Ist `ledger.admin.enabled=false` (Default), schneidet eine `@Order(1)`-`SecurityFilterChain` **jede** Route unter `/admin/**` noch vor der OIDC-Prüfung ab und liefert RFC-7807 **`404 Not Found`** (unauthentifiziert, als `viewer` und als `operator`) — selbst dann, wenn unter `/admin/**` ein Controller ohne `@ConditionalOnProperty` registriert wäre (abgesichert über `AdminPathInvariantDisabledIT`/`AdminPathInvariantEnabledIT` mit Testprofil-Route `/admin/test-only`).
+- **Explizite Token-Prüfung & Allowlist-Rollen-Mapper:** `JwtAuthenticationConverter` mappt ausschließlich die Allowlist `{viewer, writer, operator}` aus `realm_access.roles` auf `ROLE_*` und verwirft technische Keycloak-Rollen (`default-roles-*`, `offline_access`, `uma_authorization`). Der `NimbusJwtDecoder` prüft Signatur über JWKS (kein `alg=none`, kein fremder Key), `exp`/`nbf`, `iss` sowie explizit `aud = ledger-stream-api`. `401` und `403` liefern strukturierte RFC-7807-Antworten (`application/problem+json`).
+- **CORS:** Explizite Origin-Allowlist (`ledger.security.cors-allowed-origins`, kein `*` bei `allowCredentials=true`), `Allow-Headers` inkl. `Authorization` und `Idempotency-Key`, Preflight für `POST` verifiziert.
+- **Keine Secrets im Repository & Testinfrastruktur-Markierung:** [keycloak/realm-export.json](keycloak/realm-export.json) enthält den Public-PKCE-Client `ledger-stream-spa` (`S256`, ohne Secret) sowie den vertraulichen Client `ledger-stream-cli` mit Platzhalter `${LEDGER_CLI_CLIENT_SECRET}` (Injektion per Env / Kubernetes `secretKeyRef` in [deploy/kustomize/base/keycloak-deployment.yaml](deploy/kustomize/base/keycloak-deployment.yaml)). `ledger-stream-cli` mit `directAccessGrantsEnabled=true` dient ausschließlich als Test- und CI-Infrastruktur; produktive Benutzer-Logins erfolgen ausschließlich über `ledger-stream-spa` (Authorization Code + PKCE `S256`).
 
-## Ressourcenbudget (gemessene `docker stats` nach Phase 7)
+## Frontend (Vue 3 + TypeScript + Vite + `oidc-client-ts`)
 
-Keycloak 26 läuft mit `start --optimized --import-realm`, `-Xmx256m`, `KC_CACHE=local` auf der **bestehenden** PostgreSQL-16-Instanz (eigene Datenbank `keycloak`, kein H2, kein Dev-Mode, kein zweiter Postgres-Container).
+- **Idempotency-Key-Lebenszyklus (`frontend/src/composables/useBookingForm.ts`):** Der `Idempotency-Key` entsteht per `crypto.randomUUID()` beim **Öffnen** des Buchungsformulars, ist im Formular sichtbar und kopierbar und wird **niemals** im Submit-Handler erzeugt. Erst nach bestätigter `2xx`-Antwort wird ein neuer Key gezogen; „Erneut senden (gleicher Key)“ sowie parallele Doppelklicks behalten exakt denselben Key.
+- **Kein deaktivierter Submit-Button:** Während laufender Requests zeigt der Submit-Button einen Spinner (`aria-busy="true"`) statt `disabled`, ergänzt um **„Absichtlich doppelt senden (2× parallel)“** mit Live-Doppelklick-Protokoll (2 Requests, 1 Buchung, byte-gleicher Response-Body).
+- **Geld als String (`frontend/src/utils/money.ts`):** `BigDecimal`-Werte werden vom Backend als JSON-Strings (`@JsonFormat(shape = STRING)`) geliefert und direkt per `Intl.NumberFormat('de-DE', { style: 'currency', currency })` formatiert — ohne `number`-Parsing und ohne Arithmetik.
+- **Token-Lifecycle & Sichtbarkeit:** `automaticSilentRenew`, explizite Re-Login-Ansicht bei abgelaufenem Token (kein leerer Bildschirm), Logout über `end_session_endpoint`, fünf sichtbare Fehlerzustände (`401`, `403`, `422` RFC-7807 Feldfehler, `409`/Idempotenz-Replay, Netzwerk mit Retry) sowie `document.visibilityState`-gesteuertes Polling mit Backoff und `clearInterval` in `onUnmounted`.
+- **Strikte Typisierung:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, ESLint `@typescript-eslint/no-explicit-any: error` und `consistent-type-assertions: never` (0 `any`, 0 `as unknown as X`).
+
+## Ressourcenbudget (gemessene `docker stats` nach Phase 8 + Vorrechnung Phase 9)
+
+Keycloak 26 läuft mit `start --optimized --import-realm`, `-Xmx256m`, `KC_CACHE=local` auf der **bestehenden** PostgreSQL-16-Instanz (eigene Datenbank `keycloak`, kein H2, kein Dev-Mode). Nach dem Lastlauf in Phase 10 wird Keycloak erneut vermessen (`RSS > 450 MiB` → `-Xmx320m`).
 
 | Container | Limit | Tuning | Gemessener RSS | Auslastung |
 |---|---:|---|---:|---:|
-| `ledger-stream-postgres` | `320 MiB` | `shared_buffers=64MB`, `work_mem=4MB`, `lock_timeout=3s` (DBs: `ledger` + `keycloak`) | `45,84 MiB` | `14,33 %` |
-| `ledger-stream-kafka` | `448 MiB` | KRaft, `-Xms128m -Xmx192m`, `dedupe_buffer=16MB` | `202,20 MiB` | `45,13 %` |
-| `ledger-stream-schema-registry` | `384 MiB` | `FULL`, `-Xmx192m -XX:MaxMetaspaceSize=96m` | `201,20 MiB` | `52,39 %` |
-| `ledger-stream-keycloak` | `512 MiB` | `start --optimized`, `KC_DB=postgres`, `KC_CACHE=local`, `-Xms128m -Xmx256m` | `400,20 MiB` | `78,17 %` |
-| **Summe Infrastruktur (4 Container)** | — | **Zielbudget Gesamtstack: `1536 MiB` (1,5 GiB)** | **`849,44 MiB`** | **Puffer: `686,56 MiB`** |
+| `ledger-stream-postgres` | `320 MiB` | `shared_buffers=64MB`, `work_mem=4MB`, `lock_timeout=3s` (DBs: `ledger` + `keycloak`) | `22,02 MiB` | `6,88 %` |
+| `ledger-stream-kafka` | `448 MiB` | KRaft, `-Xms128m -Xmx192m`, `dedupe_buffer=16MB` | `201,40 MiB` | `44,96 %` |
+| `ledger-stream-schema-registry` | `384 MiB` | `FULL`, `-Xmx192m -XX:MaxMetaspaceSize=96m` | `221,80 MiB` | `57,76 %` |
+| `ledger-stream-keycloak` | `640 MiB` | `start --optimized`, `KC_DB=postgres`, `KC_CACHE=local`, `-Xms128m -Xmx256m` | `347,50 MiB` | `54,30 %` |
+| `ledger-stream-frontend` | `48 MiB` | `nginxinc/nginx-unprivileged:1.27-alpine` (statisches Vue-Bundle) | `15,92 MiB` | `33,16 %` |
+| **Summe gemessen (5 Container)** | — | **Zielbudget Gesamtstack: `1536 MiB` (1,5 GiB)** | **`808,64 MiB`** | **Puffer: `727,36 MiB`** |
+| _Phase 9/11 Vorausberechnung:_ `ledger-stream-app` | `384 MiB` | `-XX:MaxRAMPercentage=65` | _~220–260 MiB_ | — |
+| _Phase 9 Vorausberechnung:_ `prometheus` | `192 MiB` | `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression` | _~60–90 MiB_ | — |
+| _Phase 9 Vorausberechnung:_ `grafana` | `192 MiB` | `GF_INSTALL_PLUGINS=""`, `GF_ANALYTICS_CHECK_FOR_UPDATES=false` | _~80–110 MiB_ | — |
+| **Gesamtstack-Prognose (8 Container)** | — | **Zielkorridor: 200–300 MiB Puffer in `1536 MiB`** | **_~1269 MiB_** | **_~267 MiB Puffer_** |
 
 ## Schema-Evolution (Avro + Confluent Schema Registry)
 

@@ -73,3 +73,38 @@ jobs:
             fi
             echo "Verified bidirectional test in report: ${REQUIRED_TEST}"
           done
+
+  frontend-verify:
+    name: Frontend Verify (Node 24 + TS strict)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck (tsc + vue-tsc strict), Lint, Test and Build
+        run: |
+          npm run typecheck
+          npm run lint
+          npm test
+          npm run build
+          if grep -rn ": any" src/; then
+            echo "ERROR: Explicit 'any' type found in frontend/src!"
+            exit 1
+          fi
+          if grep -rn "as unknown" src/; then
+            echo "ERROR: 'as unknown as X' cast found in frontend/src!"
+            exit 1
+          fi
