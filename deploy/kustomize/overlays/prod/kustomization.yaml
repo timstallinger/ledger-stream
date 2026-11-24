@@ -25,7 +25,7 @@ configMapGenerator:
 # Immutable digest pinning (no :latest); images signed with Cosign + CycloneDX SBOM attestation
 images:
   - name: ghcr.io/timstallinger/ledger-stream-app
-    digest: sha256:597ae35c6c5acd76aafd1a0a3dbf40be8ef16b42e98f21495fb1288ada69d0f0
+    digest: sha256:bb6b5c666e82ef3b734f9f89ae76a60e233b4122d0835e680ae3a0f53bf10063
   - name: ghcr.io/timstallinger/ledger-stream-frontend
     digest: sha256:4f0d0405f92400ce54fe321e13b61c0ec167cd2eef553dc3dc82eb72ce63438f
   - name: ghcr.io/timstallinger/ledger-stream-keycloak
