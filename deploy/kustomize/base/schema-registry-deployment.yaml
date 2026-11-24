@@ -33,6 +33,7 @@ spec:
         app: schema-registry
     spec:
       automountServiceAccountToken: false
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

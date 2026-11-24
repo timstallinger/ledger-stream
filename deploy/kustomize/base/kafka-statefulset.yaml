@@ -7,6 +7,7 @@ metadata:
     app: kafka
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app: kafka
   ports:
@@ -36,6 +37,7 @@ spec:
         app: kafka
     spec:
       automountServiceAccountToken: false
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -76,7 +78,7 @@ spec:
             - name: KAFKA_PROCESS_ROLES
               value: "broker,controller"
             - name: KAFKA_CONTROLLER_QUORUM_VOTERS
-              value: "1@kafka-0.kafka:29093"
+              value: "1@kafka-0.kafka.ledger-stream.svc.cluster.local:29093"
             - name: KAFKA_LISTENERS
               value: "INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093"
             - name: KAFKA_ADVERTISED_LISTENERS
