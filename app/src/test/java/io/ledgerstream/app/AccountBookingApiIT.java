@@ -107,13 +107,15 @@ final class AccountBookingApiIT {
         ResponseEntity<String> accountGet = getAuthorized("/api/v1/accounts/" + accountId);
         assertThat(accountGet.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode accountJson = objectMapper.readTree(accountGet.getBody());
-        assertThat(accountJson.get("balance").decimalValue()).isEqualByComparingTo("100.25");
+        assertThat(accountJson.get("balance").isTextual()).isTrue();
+        assertThat(new BigDecimal(accountJson.get("balance").asText())).isEqualByComparingTo("100.25");
         assertThat(accountJson.get("version").asLong()).isEqualTo(2L);
 
         ResponseEntity<String> bookingsGet = getAuthorized("/api/v1/accounts/" + accountId + "/bookings");
         assertThat(bookingsGet.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode bookingsJson = objectMapper.readTree(bookingsGet.getBody());
         assertThat(bookingsJson.size()).isEqualTo(2);
+        assertThat(bookingsJson.get(0).get("amount").isTextual()).isTrue();
     }
 
     @Test
@@ -211,6 +213,13 @@ final class AccountBookingApiIT {
                 .query(Integer.class)
                 .single();
         assertThat(bookingCount).isEqualTo(1);
+        System.out.println("DOUBLE_CLICK_PROTOCOL: key=" + idempotencyKey
+                + " req1Status=" + first.getStatusCode().value()
+                + " req2Status=" + second.getStatusCode().value()
+                + " req2Replayed=" + second.getHeaders().getFirst("Idempotency-Replayed")
+                + " dbBookingCount=" + bookingCount
+                + " bodiesIdentical=" + first.getBody().equals(second.getBody())
+                + " body=" + first.getBody());
     }
 
     @Test
@@ -255,7 +264,7 @@ final class AccountBookingApiIT {
         assertThat(bookingCount).isEqualTo(1);
 
         ResponseEntity<String> accountGet = getAuthorized("/api/v1/accounts/" + accountId);
-        assertThat(objectMapper.readTree(accountGet.getBody()).get("balance").decimalValue())
+        assertThat(new BigDecimal(objectMapper.readTree(accountGet.getBody()).get("balance").asText()))
                 .isEqualByComparingTo("10.00");
     }
 
@@ -288,7 +297,7 @@ final class AccountBookingApiIT {
         assertThat(counterJson.get("originalBookingId").asText()).isEqualTo(bookingId);
 
         ResponseEntity<String> accountGet = getAuthorized("/api/v1/accounts/" + accountId);
-        assertThat(objectMapper.readTree(accountGet.getBody()).get("balance").decimalValue())
+        assertThat(new BigDecimal(objectMapper.readTree(accountGet.getBody()).get("balance").asText()))
                 .isEqualByComparingTo("0.00");
 
         Integer totalRows = jdbcClient.sql("SELECT COUNT(*) FROM bookings WHERE account_id = :id")

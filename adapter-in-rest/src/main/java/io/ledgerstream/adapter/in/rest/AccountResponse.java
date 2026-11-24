@@ -1,5 +1,6 @@
 package io.ledgerstream.adapter.in.rest;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
 import io.ledgerstream.domain.model.Account;
 
 import java.math.BigDecimal;
@@ -9,6 +10,7 @@ import java.util.UUID;
 public record AccountResponse(
         UUID id,
         String accountNumber,
+        @JsonFormat(shape = JsonFormat.Shape.STRING)
         BigDecimal balance,
         String currency,
         long version,

@@ -1,5 +1,6 @@
 package io.ledgerstream.adapter.in.rest;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
 import io.ledgerstream.domain.model.Booking;
 import io.ledgerstream.domain.model.BookingStatus;
 import io.ledgerstream.domain.model.BookingType;
@@ -12,6 +13,7 @@ public record BookingResponse(
         UUID id,
         UUID accountId,
         BookingType type,
+        @JsonFormat(shape = JsonFormat.Shape.STRING)
         BigDecimal amount,
         String currency,
         String reference,

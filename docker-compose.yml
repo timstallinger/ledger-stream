@@ -116,7 +116,7 @@ services:
       - "${KEYCLOAK_PORT:-8180}:8080"
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import-template/realm-export.json:ro
-    mem_limit: 512m
+    mem_limit: 640m
     cpus: 0.35
     healthcheck:
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q 'UP'"]
@@ -124,6 +124,53 @@ services:
       timeout: 5s
       retries: 35
       start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: ledger-stream-frontend:0.1.0
+    container_name: ledger-stream-frontend
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+      VITE_OIDC_AUTHORITY: ${VITE_OIDC_AUTHORITY:-http://localhost:8180/realms/ledger-stream}
+      VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:-ledger-stream-spa}
+    ports:
+      - "${FRONTEND_PORT:-3000}:8080"
+    mem_limit: 48m
+    cpus: 0.10
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: ledger-stream-prometheus
+    profiles: ["observability"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2d"
+      - "--storage.tsdb.wal-compression"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    mem_limit: 192m
+    cpus: 0.15
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: ledger-stream-grafana
+    profiles: ["observability"]
+    environment:
+      GF_INSTALL_PLUGINS: ""
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    mem_limit: 192m
+    cpus: 0.15
 
 volumes:
   postgres_data:

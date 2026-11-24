@@ -72,11 +72,26 @@ final class KeycloakSecurityIT {
 
         System.out.println("REAL_KEYCLOAK_ROLE_MAPPING: principal=" + authentication.getName()
                 + " aud=" + decodedJwt.getAudience()
-                + " authorities=" + authorities);
+                + " rawRealmAccess=" + decodedJwt.getClaim("realm_access")
+                + " mappedAuthorities=" + authorities);
 
         assertThat(authentication.getName()).isEqualTo(KeycloakTestEnvironment.USER_OPERATOR);
         assertThat(decodedJwt.getAudience()).contains("ledger-stream-api");
-        assertThat(authorities).contains("ROLE_viewer", "ROLE_writer", "ROLE_operator");
+        // Verify raw token actually carries Keycloak technical roles AND allowlist drops them all
+        Object realmAccess = decodedJwt.getClaim("realm_access");
+        assertThat(realmAccess).isInstanceOf(java.util.Map.class);
+        @SuppressWarnings("unchecked")
+        java.util.Collection<String> rawRoles =
+                (java.util.Collection<String>) ((java.util.Map<String, Object>) realmAccess).get("roles");
+        assertThat(rawRoles).contains(
+                "viewer",
+                "writer",
+                "operator",
+                "default-roles-ledger-stream",
+                "offline_access",
+                "uma_authorization"
+        );
+        assertThat(authorities).containsExactlyInAnyOrder("ROLE_viewer", "ROLE_writer", "ROLE_operator");
     }
 
     @Test

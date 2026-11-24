@@ -1,6 +1,8 @@
 package io.ledgerstream.app.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Value;
@@ -15,6 +17,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -35,6 +38,11 @@ import org.springframework.security.oauth2.server.resource.authentication.JwtAut
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.access.AccessDeniedHandler;
+import org.springframework.security.web.access.intercept.AuthorizationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 import java.net.URI;
@@ -50,21 +58,46 @@ import java.util.Set;
 public class SecurityConfiguration {
 
     private static final String ERROR_TYPE_PREFIX = "urn:ledger-stream:error:";
+    private static final Set<String> ALLOWED_ROLES = Set.of("viewer", "writer", "operator");
 
     /**
-     * 404-before-401: when ledger.admin.enabled=false, /admin/** bypasses JWT authentication entirely
-     * so requests (unauthenticated, viewer, or operator) reach DispatcherServlet without DlqAdminController
-     * and receive 404 Not Found without leaking path existence.
+     * 404-before-401 invariant: when ledger.admin.enabled=false, ANY /admin/** request
+     * (unauthenticated, viewer, or operator — even if a controller exists under /admin/**)
+     * is short-circuited with RFC-7807 404 Not Found before authentication runs.
      */
     @Bean
     @Order(1)
     @ConditionalOnProperty(name = "ledger.admin.enabled", havingValue = "false", matchIfMissing = true)
-    public SecurityFilterChain disabledAdminSecurityFilterChain(final HttpSecurity http) throws Exception {
+    public SecurityFilterChain disabledAdminSecurityFilterChain(
+            final HttpSecurity http,
+            final ObjectMapper objectMapper
+    ) throws Exception {
+        OncePerRequestFilter adminNotFoundFilter = new OncePerRequestFilter() {
+            @Override
+            protected void doFilterInternal(
+                    final HttpServletRequest request,
+                    final HttpServletResponse response,
+                    final FilterChain filterChain
+            ) throws ServletException, IOException {
+                writeProblem(
+                        objectMapper,
+                        request,
+                        response,
+                        HttpStatus.NOT_FOUND,
+                        "Resource not found",
+                        "NOT_FOUND",
+                        "The requested resource does not exist",
+                        false
+                );
+            }
+        };
+
         return http
                 .securityMatcher("/admin/**")
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
+                .addFilterBefore(adminNotFoundFilter, AuthorizationFilter.class)
                 .build();
     }
 
@@ -80,9 +113,12 @@ public class SecurityConfiguration {
     ) throws Exception {
         return http
                 .securityMatcher("/admin/**")
+                .cors(Customizer.withDefaults())
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                .authorizeHttpRequests(auth -> auth.anyRequest().hasRole("operator"))
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
+                        .anyRequest().hasRole("operator"))
                 .oauth2ResourceServer(oauth2 -> oauth2
                         .jwt(jwt -> jwt
                                 .decoder(jwtDecoder)
@@ -105,9 +141,11 @@ public class SecurityConfiguration {
             final AccessDeniedHandler accessDeniedHandler
     ) throws Exception {
         return http
+                .cors(Customizer.withDefaults())
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                         .requestMatchers(
                                 "/actuator/health",
                                 "/actuator/health/**",
@@ -133,6 +171,22 @@ public class SecurityConfiguration {
     }
 
     @Bean
+    public CorsConfigurationSource corsConfigurationSource(final LedgerSecurityProperties securityProperties) {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(securityProperties.corsAllowedOrigins());
+        config.setAllowedMethods(List.of("GET", "POST", "OPTIONS"));
+        config.setAllowedHeaders(List.of("Authorization", "Content-Type", "Idempotency-Key", "X-Correlation-Id"));
+        config.setExposedHeaders(List.of("Idempotency-Replayed", "X-Correlation-Id", "Retry-After"));
+        config.setAllowCredentials(true);
+        config.setMaxAge(3600L);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/api/**", config);
+        source.registerCorsConfiguration("/admin/**", config);
+        return source;
+    }
+
+    @Bean
     public JwtAuthenticationConverter keycloakJwtAuthenticationConverter() {
         JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
         converter.setPrincipalClaimName("preferred_username");
@@ -140,6 +194,11 @@ public class SecurityConfiguration {
         return converter;
     }
 
+    /**
+     * Explicit allowlist role mapper: maps ONLY viewer, writer, operator from realm_access.roles
+     * to ROLE_* authorities, discarding Keycloak technical roles (default-roles-*, offline_access,
+     * uma_authorization, etc.).
+     */
     public static Collection<GrantedAuthority> extractRealmRoleAuthorities(final Jwt jwt) {
         Object realmAccessObj = jwt.getClaims().get("realm_access");
         if (!(realmAccessObj instanceof Map<?, ?> realmAccess)) {
@@ -151,7 +210,7 @@ public class SecurityConfiguration {
         }
         Set<GrantedAuthority> authorities = new LinkedHashSet<>();
         for (Object role : roles) {
-            if (role instanceof String roleName && !roleName.isBlank()) {
+            if (role instanceof String roleName && ALLOWED_ROLES.contains(roleName)) {
                 authorities.add(new SimpleGrantedAuthority("ROLE_" + roleName));
             }
         }
