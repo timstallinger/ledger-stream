@@ -293,7 +293,7 @@ public class ApplicationConfiguration {
     @Bean
     public NewTopic ledgerEventsTopic(final KafkaTopicProperties topicProperties) {
         return TopicBuilder.name(topicProperties.ledgerEvents())
-                .partitions(3)
+                .partitions(6)
                 .replicas(1)
                 .build();
     }
@@ -301,7 +301,7 @@ public class ApplicationConfiguration {
     @Bean
     public NewTopic ledgerEventsDlqTopic(final KafkaTopicProperties topicProperties) {
         return TopicBuilder.name(topicProperties.ledgerEventsDlq())
-                .partitions(3)
+                .partitions(6)
                 .replicas(1)
                 .build();
     }

@@ -6,7 +6,7 @@ spring:
     username: ${DB_USERNAME:ledger}
     password: ${DB_PASSWORD:ledger_local_dev}
     hikari:
-      maximum-pool-size: 15
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:20}
       minimum-idle: 2
       connection-timeout: 5000
       connection-init-sql: "SET lock_timeout = '3s'"
@@ -51,7 +51,7 @@ ledger:
     consumer:
       enabled: ${KAFKA_CONSUMER_ENABLED:true}
       group-id: ${KAFKA_CONSUMER_GROUP_ID:ledger-stream-projection}
-      concurrency: ${KAFKA_CONSUMER_CONCURRENCY:1}
+      concurrency: ${KAFKA_CONSUMER_CONCURRENCY:6}
     retry:
       max-attempts: ${KAFKA_RETRY_MAX_ATTEMPTS:5}
       initial-delay-ms: ${KAFKA_RETRY_INITIAL_DELAY_MS:1000}
@@ -60,7 +60,7 @@ ledger:
     relay:
       enabled: ${OUTBOX_RELAY_ENABLED:true}
       batch-size: ${OUTBOX_RELAY_BATCH_SIZE:500}
-      fixed-delay-ms: ${OUTBOX_RELAY_FIXED_DELAY_MS:500}
+      fixed-delay-ms: ${OUTBOX_RELAY_FIXED_DELAY_MS:200}
       publish-timeout-ms: ${OUTBOX_RELAY_PUBLISH_TIMEOUT_MS:10000}
       max-attempts: ${OUTBOX_RELAY_MAX_ATTEMPTS:10}
 

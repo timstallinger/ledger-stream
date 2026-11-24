@@ -50,7 +50,7 @@ public final class LedgerEventKafkaListener {
             kafkaTemplate = "rawBytesRetryKafkaTemplate",
             listenerContainerFactory = "ledgerKafkaListenerContainerFactory",
             autoCreateTopics = "true",
-            numPartitions = "3",
+            numPartitions = "6",
             replicationFactor = "1"
     )
     @KafkaListener(

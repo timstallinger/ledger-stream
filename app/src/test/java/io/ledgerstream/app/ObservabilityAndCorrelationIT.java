@@ -271,6 +271,36 @@ final class ObservabilityAndCorrelationIT {
             assertThat(appender.events())
                     .anyMatch(ev -> ev.getFormattedMessage().contains("correlationIdRejected=true")
                             && replacedCid.equals(ev.getMDCPropertyMap().get("correlationId")));
+
+            // L5: Relay both bookings sequentially on the same thread and verify 2 distinct correlationIds in relay logs
+            Logger relayLogger = (Logger) LoggerFactory.getLogger("io.ledgerstream.adapter.out.messaging");
+            ThreadSafeLogAppender relayAppender = new ThreadSafeLogAppender();
+            relayAppender.start();
+            relayLogger.addAppender(relayAppender);
+            try {
+                int relayed = relayOutboxUseCase.relayPendingBatch();
+                assertThat(relayed).isGreaterThanOrEqualTo(2);
+
+                List<ILoggingEvent> relayLogs = relayAppender.events().stream()
+                        .filter(ev -> ev.getFormattedMessage().contains("stage=relay"))
+                        .filter(ev -> cid1.equals(ev.getMDCPropertyMap().get("correlationId"))
+                                || cid2.equals(ev.getMDCPropertyMap().get("correlationId")))
+                        .toList();
+                assertThat(relayLogs).hasSize(2);
+                String relayCid1 = relayLogs.get(0).getMDCPropertyMap().get("correlationId");
+                String relayCid2 = relayLogs.get(1).getMDCPropertyMap().get("correlationId");
+                assertThat(relayCid1).isNotEqualTo(relayCid2);
+                assertThat(List.of(relayCid1, relayCid2)).containsExactlyInAnyOrder(cid1, cid2);
+
+                LoggingEventCompositeJsonEncoder jsonEncoder = buildJsonEncoder();
+                for (ILoggingEvent relayEvent : relayLogs) {
+                    String jsonLine = new String(jsonEncoder.encode(relayEvent), StandardCharsets.UTF_8).trim();
+                    System.out.println("RELAY_MDC_LOG=" + jsonLine);
+                }
+            } finally {
+                relayLogger.detachAppender(relayAppender);
+                relayAppender.stop();
+            }
         } finally {
             filterLogger.detachAppender(appender);
             appender.stop();

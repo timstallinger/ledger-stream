@@ -102,6 +102,28 @@ public final class JdbcOutboxRepository implements OutboxRepository {
     }
 
     @Override
+    public List<OutboxEvent> lockPendingBatchByIds(final List<UUID> eventIds, final Instant now) {
+        if (eventIds == null || eventIds.isEmpty()) {
+            return List.of();
+        }
+        return jdbcClient.sql("""
+                        SELECT id, aggregate_type, aggregate_id, event_type, schema_version,
+                               payload, correlation_id, status, occurred_at, created_at,
+                               sent_at, retry_count, last_error, next_attempt_at
+                        FROM outbox_events
+                        WHERE id IN (:ids)
+                          AND status = 'PENDING'
+                          AND next_attempt_at <= :now
+                        ORDER BY created_at ASC
+                        FOR UPDATE SKIP LOCKED
+                        """)
+                .param("ids", eventIds)
+                .param("now", OffsetDateTime.ofInstant(now, ZoneOffset.UTC))
+                .query(this::mapOutboxEvent)
+                .list();
+    }
+
+    @Override
     public void markSent(final UUID eventId, final Instant sentAt) {
         jdbcClient.sql("""
                         UPDATE outbox_events
@@ -112,6 +134,23 @@ public final class JdbcOutboxRepository implements OutboxRepository {
                         """)
                 .param("sentAt", OffsetDateTime.ofInstant(sentAt, ZoneOffset.UTC))
                 .param("id", eventId)
+                .update();
+    }
+
+    @Override
+    public void markSentBatch(final List<UUID> eventIds, final Instant sentAt) {
+        if (eventIds == null || eventIds.isEmpty()) {
+            return;
+        }
+        jdbcClient.sql("""
+                        UPDATE outbox_events
+                        SET status = 'SENT',
+                            sent_at = :sentAt,
+                            last_error = NULL
+                        WHERE id IN (:ids)
+                        """)
+                .param("sentAt", OffsetDateTime.ofInstant(sentAt, ZoneOffset.UTC))
+                .param("ids", eventIds)
                 .update();
     }
 

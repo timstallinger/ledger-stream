@@ -11,8 +11,11 @@ import io.ledgerstream.application.port.out.TransactionRunner;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -74,20 +77,128 @@ public final class OutboxRelayService implements RelayOutboxUseCase {
     public int relayPendingBatch() {
         Instant now = clock.instant();
         List<PendingOutboxCandidate> candidates = outboxRepository.findPendingCandidates(batchSize, now);
+        if (candidates.isEmpty()) {
+            return 0;
+        }
+
+        // Partition into waves where each wave contains at most ONE event per aggregateId.
+        // This allows pipelined Kafka broker sends + batch markSent across distinct accounts
+        // while mathematically preserving strict per-account ordering on any failure.
+        List<List<PendingOutboxCandidate>> waves = partitionIntoDistinctAggregateWaves(candidates);
         Set<UUID> blockedAccounts = new HashSet<>();
         int publishedCount = 0;
 
-        for (PendingOutboxCandidate candidate : candidates) {
-            if (blockedAccounts.contains(candidate.aggregateId())) {
+        for (List<PendingOutboxCandidate> wave : waves) {
+            List<PendingOutboxCandidate> eligible = wave.stream()
+                    .filter(c -> !blockedAccounts.contains(c.aggregateId()))
+                    .toList();
+            if (eligible.isEmpty()) {
                 continue;
             }
-            if (relaySingleEvent(candidate, now)) {
-                publishedCount++;
+            if (eligible.size() == 1) {
+                PendingOutboxCandidate single = eligible.get(0);
+                if (relaySingleEvent(single, now)) {
+                    publishedCount++;
+                } else {
+                    blockedAccounts.add(single.aggregateId());
+                }
             } else {
-                blockedAccounts.add(candidate.aggregateId());
+                publishedCount += relayWave(eligible, now, blockedAccounts);
             }
         }
         return publishedCount;
+    }
+
+    private int relayWave(
+            final List<PendingOutboxCandidate> wave,
+            final Instant pollTime,
+            final Set<UUID> blockedAccounts
+    ) {
+        Map<UUID, PendingOutboxCandidate> candidateById = new LinkedHashMap<>();
+        List<UUID> waveIds = new ArrayList<>(wave.size());
+        for (PendingOutboxCandidate candidate : wave) {
+            candidateById.put(candidate.eventId(), candidate);
+            waveIds.add(candidate.eventId());
+        }
+
+        Map<UUID, RuntimeException> publishFailures = new LinkedHashMap<>();
+        int wavePublished = 0;
+        try {
+            List<OutboxEvent> succeededEvents = transactionRunner.executeInTransaction(() -> {
+                List<OutboxEvent> locked = outboxRepository.lockPendingBatchByIds(waveIds, pollTime);
+                if (locked.isEmpty()) {
+                    return List.of();
+                }
+                Map<UUID, RuntimeException> failures = eventPublisher.publishBatch(locked);
+                publishFailures.putAll(failures);
+
+                List<OutboxEvent> succeeded = new ArrayList<>(locked.size());
+                List<UUID> succeededIds = new ArrayList<>(locked.size());
+                for (OutboxEvent event : locked) {
+                    if (!failures.containsKey(event.id())) {
+                        succeeded.add(event);
+                        succeededIds.add(event.id());
+                    }
+                }
+                if (!succeededIds.isEmpty()) {
+                    outboxRepository.markSentBatch(succeededIds, clock.instant());
+                }
+                return succeeded;
+            });
+
+            if (succeededEvents != null) {
+                for (OutboxEvent event : succeededEvents) {
+                    observer.onEventRelayed(event.eventType(), true);
+                    wavePublished++;
+                }
+            }
+        } catch (RuntimeException txFailure) {
+            // DB commit / markSentBatch failed for the wave: record backoff for every candidate in wave
+            for (PendingOutboxCandidate candidate : wave) {
+                blockedAccounts.add(candidate.aggregateId());
+                observer.onEventRelayed("unknown", false);
+                recordFailureWithBackoff(candidate, txFailure);
+            }
+            return 0;
+        }
+
+        for (Map.Entry<UUID, RuntimeException> failure : publishFailures.entrySet()) {
+            PendingOutboxCandidate candidate = candidateById.get(failure.getKey());
+            if (candidate != null) {
+                blockedAccounts.add(candidate.aggregateId());
+                observer.onEventRelayed("unknown", false);
+                recordFailureWithBackoff(candidate, failure.getValue());
+            }
+        }
+        return wavePublished;
+    }
+
+    private static List<List<PendingOutboxCandidate>> partitionIntoDistinctAggregateWaves(
+            final List<PendingOutboxCandidate> candidates
+    ) {
+        List<List<PendingOutboxCandidate>> waves = new ArrayList<>();
+        List<Set<UUID>> waveAggregates = new ArrayList<>();
+        for (PendingOutboxCandidate candidate : candidates) {
+            int targetWave = -1;
+            for (int i = 0; i < waves.size(); i++) {
+                if (!waveAggregates.get(i).contains(candidate.aggregateId())) {
+                    targetWave = i;
+                    break;
+                }
+            }
+            if (targetWave < 0) {
+                List<PendingOutboxCandidate> newWave = new ArrayList<>();
+                Set<UUID> newAggs = new HashSet<>();
+                newWave.add(candidate);
+                newAggs.add(candidate.aggregateId());
+                waves.add(newWave);
+                waveAggregates.add(newAggs);
+            } else {
+                waves.get(targetWave).add(candidate);
+                waveAggregates.get(targetWave).add(candidate.aggregateId());
+            }
+        }
+        return waves;
     }
 
     private boolean relaySingleEvent(final PendingOutboxCandidate candidate, final Instant pollTime) {

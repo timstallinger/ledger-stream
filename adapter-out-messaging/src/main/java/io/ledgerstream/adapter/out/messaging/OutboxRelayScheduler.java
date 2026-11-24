@@ -17,7 +17,7 @@ public final class OutboxRelayScheduler {
         this.relayOutboxUseCase = Objects.requireNonNull(relayOutboxUseCase, "relayOutboxUseCase must not be null");
     }
 
-    @Scheduled(fixedDelayString = "${ledger.outbox.relay.fixed-delay-ms:500}")
+    @Scheduled(fixedDelayString = "${ledger.outbox.relay.fixed-delay-ms:200}")
     public void pollAndRelay() {
         int relayed = relayOutboxUseCase.relayPendingBatch();
         if (relayed > 0) {

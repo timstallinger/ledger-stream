@@ -11,9 +11,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -47,29 +54,11 @@ public final class KafkaOutboxEventPublisher implements OutboxEventPublisher {
     @Override
     public void publish(final OutboxEvent event) {
         Objects.requireNonNull(event, "event must not be null");
-        String accountPartitionKey = Objects.requireNonNull(
-                event.aggregateId(),
-                "aggregateId (accountId) must not be null for partition ordering"
-        ).toString();
-        LedgerBookingEvent avroEvent = toAvroRecord(event);
-        ProducerRecord<String, LedgerBookingEvent> record = new ProducerRecord<>(
-                topicProperties.ledgerEvents(),
-                accountPartitionKey,
-                avroEvent
-        );
-        addHeader(record, "eventId", event.id().toString());
-        addHeader(record, "eventType", event.eventType());
-        addHeader(record, "schemaVersion", Integer.toString(event.schemaVersion()));
-        if (event.correlationId() != null && !event.correlationId().isBlank()) {
-            addHeader(record, "X-Correlation-Id", event.correlationId());
-        }
+        ProducerRecord<String, LedgerBookingEvent> record = buildProducerRecord(event);
 
         String previousCorrelationId = MDC.get(MDC_CORRELATION_ID);
         String previousEventId = MDC.get(MDC_EVENT_ID);
-        if (event.correlationId() != null && !event.correlationId().isBlank()) {
-            MDC.put(MDC_CORRELATION_ID, event.correlationId());
-        }
-        MDC.put(MDC_EVENT_ID, event.id().toString());
+        setMdc(event);
         try {
             kafkaTemplate.send(record).get(publishTimeoutMs, TimeUnit.MILLISECONDS);
             LOG.info(
@@ -87,6 +76,106 @@ public final class KafkaOutboxEventPublisher implements OutboxEventPublisher {
             restoreMdc(MDC_CORRELATION_ID, previousCorrelationId);
             restoreMdc(MDC_EVENT_ID, previousEventId);
         }
+    }
+
+    @Override
+    public Map<UUID, RuntimeException> publishBatch(final List<OutboxEvent> events) {
+        if (events == null || events.isEmpty()) {
+            return Map.of();
+        }
+        if (events.size() == 1) {
+            OutboxEvent single = events.get(0);
+            try {
+                publish(single);
+                return Map.of();
+            } catch (RuntimeException exception) {
+                return Map.of(single.id(), exception);
+            }
+        }
+
+        Map<UUID, RuntimeException> failures = new LinkedHashMap<>();
+        List<InFlightPublish> inFlight = new ArrayList<>(events.size());
+
+        for (OutboxEvent event : events) {
+            try {
+                ProducerRecord<String, LedgerBookingEvent> record = buildProducerRecord(event);
+                CompletableFuture<SendResult<String, LedgerBookingEvent>> future = kafkaTemplate.send(record);
+                inFlight.add(new InFlightPublish(event, future));
+            } catch (RuntimeException exception) {
+                failures.put(event.id(), exception);
+            }
+        }
+
+        if (!inFlight.isEmpty()) {
+            kafkaTemplate.flush();
+        }
+
+        for (InFlightPublish item : inFlight) {
+            OutboxEvent event = item.event();
+            String previousCorrelationId = MDC.get(MDC_CORRELATION_ID);
+            String previousEventId = MDC.get(MDC_EVENT_ID);
+            setMdc(event);
+            try {
+                item.future().get(publishTimeoutMs, TimeUnit.MILLISECONDS);
+                LOG.info(
+                        "Relayed outbox event to Kafka: stage=relay eventType={} topic={} schemaVersion={}",
+                        event.eventType(),
+                        topicProperties.ledgerEvents(),
+                        event.schemaVersion()
+                );
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                failures.put(
+                        event.id(),
+                        new IllegalStateException("Interrupted while publishing outbox event " + event.id(), exception)
+                );
+            } catch (ExecutionException | TimeoutException exception) {
+                failures.put(
+                        event.id(),
+                        new IllegalStateException("Failed to publish outbox event " + event.id() + " to Kafka", exception)
+                );
+            } finally {
+                restoreMdc(MDC_CORRELATION_ID, previousCorrelationId);
+                restoreMdc(MDC_EVENT_ID, previousEventId);
+            }
+        }
+
+        return failures;
+    }
+
+    private ProducerRecord<String, LedgerBookingEvent> buildProducerRecord(final OutboxEvent event) {
+        String accountPartitionKey = Objects.requireNonNull(
+                event.aggregateId(),
+                "aggregateId (accountId) must not be null for partition ordering"
+        ).toString();
+        LedgerBookingEvent avroEvent = toAvroRecord(event);
+        ProducerRecord<String, LedgerBookingEvent> record = new ProducerRecord<>(
+                topicProperties.ledgerEvents(),
+                accountPartitionKey,
+                avroEvent
+        );
+        addHeader(record, "eventId", event.id().toString());
+        addHeader(record, "eventType", event.eventType());
+        addHeader(record, "schemaVersion", Integer.toString(event.schemaVersion()));
+        if (event.correlationId() != null && !event.correlationId().isBlank()) {
+            addHeader(record, "X-Correlation-Id", event.correlationId());
+        }
+        return record;
+    }
+
+    private static void setMdc(final OutboxEvent event) {
+        if (event.correlationId() != null && !event.correlationId().isBlank()) {
+            MDC.put(MDC_CORRELATION_ID, event.correlationId());
+        } else {
+            MDC.remove(MDC_CORRELATION_ID);
+        }
+        MDC.put(MDC_EVENT_ID, event.id().toString());
+    }
+
+    private record InFlightPublish(
+            OutboxEvent event,
+            CompletableFuture<SendResult<String, LedgerBookingEvent>> future
+    ) {
     }
 
     private static void restoreMdc(final String key, final String previousValue) {
