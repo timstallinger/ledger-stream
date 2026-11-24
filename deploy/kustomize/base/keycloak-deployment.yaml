@@ -1,0 +1,64 @@
+# Example Kubernetes envFrom / secretKeyRef binding for Keycloak runtime secrets.
+# Actual Secret objects are never committed in plaintext (Sealed Secrets follow in Phase 11).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: ghcr.io/timstallinger/ledger-stream-keycloak:26.2.5
+          args:
+            - start
+            - --optimized
+            - --import-realm
+          env:
+            - name: KC_DB
+              value: postgres
+            - name: KC_CACHE
+              value: local
+            - name: KC_DB_URL
+              value: jdbc:postgresql://postgres:5432/keycloak
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-stream-db-secret
+                  key: username
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-stream-db-secret
+                  key: password
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-secrets
+                  key: admin-username
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-secrets
+                  key: admin-password
+            - name: LEDGER_CLI_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-secrets
+                  key: cli-client-secret
+            - name: JAVA_OPTS_APPEND
+              value: "-Xms128m -Xmx256m"
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 350m

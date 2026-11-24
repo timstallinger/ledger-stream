@@ -10,3 +10,6 @@ data:
   OUTBOX_RELAY_BATCH_SIZE: "500"
   OUTBOX_RELAY_MAX_ATTEMPTS: "10"
   KAFKA_RETRY_MAX_ATTEMPTS: "5"
+  OIDC_EXPECTED_AUDIENCE: "ledger-stream-api"
+  OIDC_ISSUER_URI: "http://keycloak:8080/realms/ledger-stream"
+  OIDC_JWK_SET_URI: "http://keycloak:8080/realms/ledger-stream/protocol/openid-connect/certs"

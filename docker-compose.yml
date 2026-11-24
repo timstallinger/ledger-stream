@@ -20,6 +20,7 @@ services:
       - "lock_timeout=3s"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init-keycloak-db.sql:/docker-entrypoint-initdb.d/01-init-keycloak-db.sql:ro
     mem_limit: 320m
     cpus: 0.25
     healthcheck:
@@ -87,6 +88,42 @@ services:
       timeout: 5s
       retries: 20
       start_period: 15s
+
+  keycloak:
+    build:
+      context: ./keycloak
+      dockerfile: Dockerfile
+    image: ledger-stream-keycloak:26.2.5
+    container_name: ledger-stream-keycloak
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["start", "--optimized", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_CACHE: local
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: ${POSTGRES_USER:-ledger}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-ledger_local_dev}
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-change_me_local_admin}
+      LEDGER_CLI_CLIENT_SECRET: ${LEDGER_CLI_CLIENT_SECRET:-change_me_local_cli_secret}
+      JAVA_OPTS_APPEND: "-Xms128m -Xmx256m"
+    ports:
+      - "${KEYCLOAK_PORT:-8180}:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import-template/realm-export.json:ro
+    mem_limit: 512m
+    cpus: 0.35
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q 'UP'"]
+      interval: 5s
+      timeout: 5s
+      retries: 35
+      start_period: 30s
 
 volumes:
   postgres_data:
