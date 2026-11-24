@@ -46,7 +46,7 @@ spec:
       initContainers:
         - name: seed-kafka-config
           image: apache/kafka:3.9.1
-          command: ["sh", "-c", "cp -a /opt/kafka/config/. /writable-config/"]
+          command: ["sh", "-c", "cp -r /opt/kafka/config/* /writable-config/"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

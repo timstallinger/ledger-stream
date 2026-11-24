@@ -43,7 +43,7 @@ spec:
       initContainers:
         - name: seed-etc-schema-registry
           image: confluentinc/cp-schema-registry:7.9.9
-          command: ["sh", "-c", "cp -a /etc/schema-registry/. /writable-etc/"]
+          command: ["sh", "-c", "cp -r /etc/schema-registry/* /writable-etc/"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
