@@ -6,15 +6,24 @@ import io.ledgerstream.application.port.in.NonRetryableEventException;
 import io.ledgerstream.application.port.in.ProjectLedgerEventUseCase;
 import io.ledgerstream.application.port.out.ConsumerEventObserver;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.Header;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.regex.Pattern;
 
 public final class LedgerEventRecordProcessor {
 
     private static final Logger LOG = LoggerFactory.getLogger(LedgerEventRecordProcessor.class);
+    private static final String HEADER_CORRELATION_ID = "X-Correlation-Id";
+    private static final String MDC_CORRELATION_ID = "correlationId";
+    private static final String MDC_EVENT_ID = "eventId";
+    private static final Pattern VALID_CORRELATION_ID = Pattern.compile("^[A-Za-z0-9._-]{8,64}$");
 
     private final ProjectLedgerEventUseCase projectLedgerEventUseCase;
     private final LedgerEventRecordMapper recordMapper;
@@ -36,12 +45,7 @@ public final class LedgerEventRecordProcessor {
     /**
      * Processes one Kafka record with strict manual offset acknowledgment AFTER database commit.
      *
-     * Error classification:
-     * - Deserialization failures and malformed payloads throw NonRetryableEventException (0 retries -> direct DLQ)
-     *   while RawPayloadPreservingAvroDeserializer keeps the exact original bytes in payload and headers.
-     * - Business validation errors (unknown account, amount <= 0, invalid type) throw NonRetryableEventException
-     *   (0 retries -> direct DLQ).
-     * - Technical errors propagate to @RetryableTopic (non-blocking retry topics, up to 5 attempts, then DLQ).
+     * Sets correlationId and eventId in MDC for structured logging and ALWAYS clears MDC in finally.
      */
     public EventProcessingOutcome processRecord(
             final ConsumerRecord<String, LedgerConsumerMessage> record,
@@ -50,41 +54,78 @@ public final class LedgerEventRecordProcessor {
         Objects.requireNonNull(record, "record must not be null");
         Objects.requireNonNull(acknowledgeAfterCommit, "acknowledgeAfterCommit must not be null");
 
-        LedgerConsumerMessage message = record.value();
-        String keyRef = record.key() != null
-                ? record.key()
-                : "partition-" + record.partition() + "-offset-" + record.offset();
+        String correlationId = resolveCorrelationId(record);
+        MDC.put(MDC_CORRELATION_ID, correlationId);
+        try {
+            LedgerConsumerMessage message = record.value();
+            String keyRef = record.key() != null
+                    ? record.key()
+                    : "partition-" + record.partition() + "-offset-" + record.offset();
 
-        if (message == null || message.isDeserializationFailure()) {
-            String errorMsg = message != null && message.deserializationErrorMessage() != null
-                    ? message.deserializationErrorMessage()
-                    : "Null or undeserializable record value";
-            LOG.warn(
-                    "Deserialization failure routed directly to DLQ without retry: topic={}, partition={}, offset={}, key={}, error={}",
-                    record.topic(),
-                    record.partition(),
-                    record.offset(),
-                    record.key(),
-                    errorMsg
-            );
-            observer.onPoisonRejected(keyRef, "deserialization_error");
-            throw new NonRetryableEventException("deserialization_error", errorMsg);
-        }
+            if (message == null || message.isDeserializationFailure()) {
+                String errorMsg = message != null && message.deserializationErrorMessage() != null
+                        ? message.deserializationErrorMessage()
+                        : "Null or undeserializable record value";
+                LOG.warn(
+                        "Deserialization failure routed directly to DLQ without retry: stage=consumer topic={} partition={} offset={}",
+                        record.topic(),
+                        record.partition(),
+                        record.offset()
+                );
+                observer.onPoisonRejected(keyRef, "deserialization_error");
+                throw new NonRetryableEventException("deserialization_error", errorMsg);
+            }
 
-        Optional<IncomingLedgerEvent> mapped = recordMapper.map(message.record());
-        if (mapped.isEmpty()) {
-            LOG.warn(
-                    "Malformed Avro payload routed directly to DLQ without retry: topic={}, partition={}, offset={}",
+            Optional<IncomingLedgerEvent> mapped = recordMapper.map(message.record());
+            if (mapped.isEmpty()) {
+                LOG.warn(
+                        "Malformed Avro payload routed directly to DLQ without retry: stage=consumer topic={} partition={} offset={}",
+                        record.topic(),
+                        record.partition(),
+                        record.offset()
+                );
+                observer.onPoisonRejected(keyRef, "malformed_payload");
+                throw new NonRetryableEventException("malformed_payload", "Malformed Avro payload fields");
+            }
+
+            IncomingLedgerEvent incoming = mapped.get();
+            if (incoming.eventId() != null) {
+                MDC.put(MDC_EVENT_ID, incoming.eventId().toString());
+            }
+
+            EventProcessingOutcome outcome = projectLedgerEventUseCase.process(incoming);
+            acknowledgeAfterCommit.run();
+            LOG.info(
+                    "Projected ledger event in consumer: stage=consumer eventType={} outcome={} topic={} partition={} offset={}",
+                    incoming.eventType(),
+                    outcome,
                     record.topic(),
                     record.partition(),
                     record.offset()
             );
-            observer.onPoisonRejected(keyRef, "malformed_payload");
-            throw new NonRetryableEventException("malformed_payload", "Malformed Avro payload fields");
+            return outcome;
+        } finally {
+            MDC.clear();
         }
+    }
 
-        EventProcessingOutcome outcome = projectLedgerEventUseCase.process(mapped.get());
-        acknowledgeAfterCommit.run();
-        return outcome;
+    private static String resolveCorrelationId(final ConsumerRecord<?, ?> record) {
+        Header header = record.headers().lastHeader(HEADER_CORRELATION_ID);
+        if (header == null || header.value() == null) {
+            return UUID.randomUUID().toString();
+        }
+        String raw = new String(header.value(), StandardCharsets.UTF_8);
+        if (VALID_CORRELATION_ID.matcher(raw).matches()) {
+            return raw;
+        }
+        String fresh = UUID.randomUUID().toString();
+        MDC.put(MDC_CORRELATION_ID, fresh);
+        LOG.warn(
+                "Invalid Kafka X-Correlation-Id header rejected; generated fresh correlationId: correlationIdRejected=true topic={} partition={} offset={}",
+                record.topic(),
+                record.partition(),
+                record.offset()
+        );
+        return fresh;
     }
 }

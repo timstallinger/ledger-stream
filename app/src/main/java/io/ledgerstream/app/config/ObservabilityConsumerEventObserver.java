@@ -8,26 +8,41 @@ import org.slf4j.LoggerFactory;
 
 import java.util.UUID;
 
+/**
+ * Micrometer metrics observer for the Kafka consumer.
+ * Cardinality policy (N4): ONLY closed-set labels (outcome, reason) — never IDs or amounts.
+ */
 public final class ObservabilityConsumerEventObserver implements ConsumerEventObserver {
 
     private static final Logger LOG = LoggerFactory.getLogger(ObservabilityConsumerEventObserver.class);
 
-    private final Counter processedCounter;
+    private final Counter processedOutcomeCounter;
+    private final Counter duplicateOutcomeCounter;
+    private final Counter poisonOutcomeCounter;
     private final Counter duplicateRejectedCounter;
     private final Counter poisonRejectedCounter;
     private final Counter retriesCounter;
 
     public ObservabilityConsumerEventObserver(final MeterRegistry meterRegistry) {
-        this.processedCounter = Counter.builder("consumer_processed_total")
-                .description("Total number of ledger events projected into account_summary")
+        this.processedOutcomeCounter = Counter.builder("consumer_processed_total")
+                .tag("outcome", "processed")
+                .description("Total number of consumer events by closed-set outcome (processed, duplicate, poison)")
+                .register(meterRegistry);
+        this.duplicateOutcomeCounter = Counter.builder("consumer_processed_total")
+                .tag("outcome", "duplicate")
+                .description("Total number of consumer events by closed-set outcome (processed, duplicate, poison)")
+                .register(meterRegistry);
+        this.poisonOutcomeCounter = Counter.builder("consumer_processed_total")
+                .tag("outcome", "poison")
+                .description("Total number of consumer events by closed-set outcome (processed, duplicate, poison)")
                 .register(meterRegistry);
         this.duplicateRejectedCounter = Counter.builder("consumer_duplicates_rejected_total")
                 .tag("reason", "duplicate")
-                .description("Total number of rejected consumer events by reason (duplicate or poison)")
+                .description("Total number of rejected consumer events by closed-set reason (duplicate or poison)")
                 .register(meterRegistry);
         this.poisonRejectedCounter = Counter.builder("consumer_duplicates_rejected_total")
                 .tag("reason", "poison")
-                .description("Total number of rejected consumer events by reason (duplicate or poison)")
+                .description("Total number of rejected consumer events by closed-set reason (duplicate or poison)")
                 .register(meterRegistry);
         this.retriesCounter = Counter.builder("consumer_retries_total")
                 .description("Total number of non-blocking consumer retry attempts executed")
@@ -36,24 +51,26 @@ public final class ObservabilityConsumerEventObserver implements ConsumerEventOb
 
     @Override
     public void onProcessed(final UUID eventId) {
-        processedCounter.increment();
+        processedOutcomeCounter.increment();
     }
 
     @Override
     public void onDuplicateRejected(final UUID eventId) {
+        duplicateOutcomeCounter.increment();
         duplicateRejectedCounter.increment();
         LOG.debug("Rejected duplicate event via UNIQUE(event_id): eventId={}", eventId);
     }
 
     @Override
     public void onPoisonRejected(final String eventIdOrKey, final String reason) {
+        poisonOutcomeCounter.increment();
         poisonRejectedCounter.increment();
-        LOG.warn("Rejected poison event directly to DLQ: ref={}, reason={}", eventIdOrKey, reason);
+        LOG.warn("Rejected poison event directly to DLQ: reason={}", reason);
     }
 
     @Override
     public void onRetryAttempt(final String topic, final int attemptNumber, final String errorClass) {
         retriesCounter.increment();
-        LOG.warn("Executing consumer retry attempt: topic={}, attempt={}, category={}", topic, attemptNumber, errorClass);
+        LOG.warn("Executing consumer retry attempt: topic={} attempt={} errorClass={}", topic, attemptNumber, errorClass);
     }
 }

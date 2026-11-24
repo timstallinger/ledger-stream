@@ -7,6 +7,9 @@ import io.ledgerstream.application.port.out.OutboxEvent;
 import io.ledgerstream.application.port.out.OutboxEventPublisher;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.header.internals.RecordHeader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.kafka.core.KafkaTemplate;
 
 import java.nio.charset.StandardCharsets;
@@ -16,6 +19,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 public final class KafkaOutboxEventPublisher implements OutboxEventPublisher {
+
+    private static final Logger LOG = LoggerFactory.getLogger(KafkaOutboxEventPublisher.class);
+    private static final String MDC_CORRELATION_ID = "correlationId";
+    private static final String MDC_EVENT_ID = "eventId";
 
     private final KafkaTemplate<String, LedgerBookingEvent> kafkaTemplate;
     private final KafkaTopicProperties topicProperties;
@@ -57,13 +64,36 @@ public final class KafkaOutboxEventPublisher implements OutboxEventPublisher {
             addHeader(record, "X-Correlation-Id", event.correlationId());
         }
 
+        String previousCorrelationId = MDC.get(MDC_CORRELATION_ID);
+        String previousEventId = MDC.get(MDC_EVENT_ID);
+        if (event.correlationId() != null && !event.correlationId().isBlank()) {
+            MDC.put(MDC_CORRELATION_ID, event.correlationId());
+        }
+        MDC.put(MDC_EVENT_ID, event.id().toString());
         try {
             kafkaTemplate.send(record).get(publishTimeoutMs, TimeUnit.MILLISECONDS);
+            LOG.info(
+                    "Relayed outbox event to Kafka: stage=relay eventType={} topic={} schemaVersion={}",
+                    event.eventType(),
+                    topicProperties.ledgerEvents(),
+                    event.schemaVersion()
+            );
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Interrupted while publishing outbox event " + event.id(), exception);
         } catch (ExecutionException | TimeoutException exception) {
             throw new IllegalStateException("Failed to publish outbox event " + event.id() + " to Kafka", exception);
+        } finally {
+            restoreMdc(MDC_CORRELATION_ID, previousCorrelationId);
+            restoreMdc(MDC_EVENT_ID, previousEventId);
+        }
+    }
+
+    private static void restoreMdc(final String key, final String previousValue) {
+        if (previousValue == null) {
+            MDC.remove(key);
+        } else {
+            MDC.put(key, previousValue);
         }
     }
 

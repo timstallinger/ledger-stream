@@ -11,8 +11,18 @@ public record CancelBookingCommand(
         AccountId accountId,
         BookingId bookingId,
         Reference reference,
-        IdempotencyKey idempotencyKey
+        IdempotencyKey idempotencyKey,
+        String correlationId
 ) {
+
+    public CancelBookingCommand(
+            final AccountId accountId,
+            final BookingId bookingId,
+            final Reference reference,
+            final IdempotencyKey idempotencyKey
+    ) {
+        this(accountId, bookingId, reference, idempotencyKey, null);
+    }
 
     public CancelBookingCommand {
         Objects.requireNonNull(accountId, "accountId must not be null");

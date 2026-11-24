@@ -17,6 +17,9 @@ import io.ledgerstream.domain.model.IdempotencyKey;
 import io.ledgerstream.domain.model.Money;
 import io.ledgerstream.domain.model.Reference;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -36,6 +39,7 @@ import java.util.UUID;
 @RequestMapping("/api/v1/accounts/{accountId}/bookings")
 public final class BookingController {
 
+    private static final Logger LOG = LoggerFactory.getLogger(BookingController.class);
     private static final String HEADER_IDEMPOTENCY_KEY = "Idempotency-Key";
     private static final String HEADER_IDEMPOTENCY_REPLAYED = "Idempotency-Replayed";
 
@@ -62,14 +66,22 @@ public final class BookingController {
             @RequestHeader(HEADER_IDEMPOTENCY_KEY) final String idempotencyKeyHeader,
             @Valid @RequestBody final CreateBookingRequest request
     ) {
+        String correlationId = MDC.get(CorrelationIdFilter.MDC_CORRELATION_ID);
         CreateBookingCommand command = new CreateBookingCommand(
                 AccountId.of(accountId),
                 request.type(),
                 Money.of(request.amount(), CurrencyCode.of(request.currency())),
                 Reference.of(request.reference()),
-                IdempotencyKey.of(idempotencyKeyHeader)
+                IdempotencyKey.of(idempotencyKeyHeader),
+                correlationId
         );
         IdempotentExecutionResult result = createBookingUseCase.execute(command, this::serializeCreatedBooking);
+        LOG.info(
+                "HTTP booking request completed: stage=http type={} status={} replayed={}",
+                request.type(),
+                result.response().statusCode(),
+                result.replayed()
+        );
         return toHttpResponse(result);
     }
 
@@ -80,13 +92,20 @@ public final class BookingController {
             @RequestHeader(HEADER_IDEMPOTENCY_KEY) final String idempotencyKeyHeader,
             @Valid @RequestBody final CancelBookingRequest request
     ) {
+        String correlationId = MDC.get(CorrelationIdFilter.MDC_CORRELATION_ID);
         CancelBookingCommand command = new CancelBookingCommand(
                 AccountId.of(accountId),
                 BookingId.of(bookingId),
                 Reference.of(request.reference()),
-                IdempotencyKey.of(idempotencyKeyHeader)
+                IdempotencyKey.of(idempotencyKeyHeader),
+                correlationId
         );
         IdempotentExecutionResult result = cancelBookingUseCase.execute(command, this::serializeCreatedBooking);
+        LOG.info(
+                "HTTP cancellation request completed: stage=http status={} replayed={}",
+                result.response().statusCode(),
+                result.replayed()
+        );
         return toHttpResponse(result);
     }
 

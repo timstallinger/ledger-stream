@@ -100,9 +100,11 @@ public final class OutboxRelayService implements RelayOutboxUseCase {
                 OutboxEvent event = locked.get();
                 eventPublisher.publish(event);
                 outboxRepository.markSent(event.id(), clock.instant());
+                observer.onEventRelayed(event.eventType(), true);
                 return true;
             }));
         } catch (RuntimeException exception) {
+            observer.onEventRelayed("unknown", false);
             recordFailureWithBackoff(candidate, exception);
             return false;
         }

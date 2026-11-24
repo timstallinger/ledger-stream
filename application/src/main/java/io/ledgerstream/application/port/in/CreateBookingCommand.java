@@ -13,8 +13,19 @@ public record CreateBookingCommand(
         BookingType type,
         Money amount,
         Reference reference,
-        IdempotencyKey idempotencyKey
+        IdempotencyKey idempotencyKey,
+        String correlationId
 ) {
+
+    public CreateBookingCommand(
+            final AccountId accountId,
+            final BookingType type,
+            final Money amount,
+            final Reference reference,
+            final IdempotencyKey idempotencyKey
+    ) {
+        this(accountId, type, amount, reference, idempotencyKey, null);
+    }
 
     public CreateBookingCommand {
         Objects.requireNonNull(accountId, "accountId must not be null");

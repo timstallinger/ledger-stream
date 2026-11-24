@@ -3,6 +3,7 @@ package io.ledgerstream.app.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.ledgerstream.adapter.in.rest.AccountController;
 import io.ledgerstream.adapter.in.rest.BookingController;
+import io.ledgerstream.adapter.in.rest.CorrelationIdFilter;
 import io.ledgerstream.adapter.in.rest.DlqAdminController;
 import io.ledgerstream.adapter.in.rest.ProblemDetailExceptionHandler;
 import io.ledgerstream.adapter.out.messaging.KafkaOutboxEventPublisher;
@@ -49,9 +50,11 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
+import org.springframework.core.Ordered;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.kafka.config.TopicBuilder;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -69,6 +72,14 @@ import java.time.Duration;
         ProblemDetailExceptionHandler.class
 })
 public class ApplicationConfiguration {
+
+    @Bean
+    public FilterRegistrationBean<CorrelationIdFilter> correlationIdFilterRegistration() {
+        FilterRegistrationBean<CorrelationIdFilter> registration = new FilterRegistrationBean<>(new CorrelationIdFilter());
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
+        registration.addUrlPatterns("/*");
+        return registration;
+    }
 
     @Bean
     public Clock clock() {
