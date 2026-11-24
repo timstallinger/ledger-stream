@@ -108,6 +108,7 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-change_me_local_admin}
       LEDGER_CLI_CLIENT_SECRET: ${LEDGER_CLI_CLIENT_SECRET:-change_me_local_cli_secret}
@@ -124,6 +125,43 @@ services:
       timeout: 5s
       retries: 35
       start_period: 30s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ledger-stream-app:0.1.0
+    container_name: ledger-stream-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-ledger}
+      DB_USERNAME: ${POSTGRES_USER:-ledger}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-ledger_local_dev}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      OIDC_ISSUER_URI: ${OIDC_ISSUER_URI:-http://localhost:8180/realms/ledger-stream}
+      OIDC_JWK_SET_URI: http://keycloak:8080/realms/ledger-stream/protocol/openid-connect/certs
+      OIDC_EXPECTED_AUDIENCE: ledger-stream-api
+      LEDGER_ADMIN_ENABLED: ${LEDGER_ADMIN_ENABLED:-false}
+      JAVA_OPTS: "-XX:MaxRAMPercentage=65.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    mem_limit: 384m
+    cpus: 0.35
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health/readiness | grep -q 'UP' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 25
+      start_period: 15s
 
   frontend:
     build:
@@ -149,28 +187,53 @@ services:
   prometheus:
     image: prom/prometheus:v3.2.1
     container_name: ledger-stream-prometheus
-    profiles: ["observability"]
+    depends_on:
+      app:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=2d"
       - "--storage.tsdb.wal-compression"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
     mem_limit: 192m
     cpus: 0.15
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/ready > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
 
   grafana:
     image: grafana/grafana:11.5.2
     container_name: ledger-stream-grafana
-    profiles: ["observability"]
+    depends_on:
+      prometheus:
+        condition: service_healthy
     environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change_me_local_grafana}
       GF_INSTALL_PLUGINS: ""
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "${GRAFANA_PORT:-3001}:3000"
     mem_limit: 192m
     cpus: 0.15
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
 
 volumes:
   postgres_data:

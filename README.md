@@ -44,11 +44,13 @@ Architekturentscheidungen werden als ADRs unter [`docs/adr/`](docs/adr/) gepfleg
 
 Jede schreibende Buchungsoperation (`POST /api/v1/accounts/{id}/bookings`, `POST /api/v1/accounts/{id}/bookings/{bookingId}/cancel`) erfordert den Header `Idempotency-Key` (1–128 Zeichen, eindeutig pro Konto über `UNIQUE (account_id, idempotency_key)`):
 
-1. **Atomare Persistenz der Erfolgsantwort:** Statuscode und serialisierter JSON-Response-Body werden in derselben Datenbanktransaktion wie die Konto- und Buchungsänderung in `idempotency_keys` persistiert.
-2. **Byte-gleiches Replay:** Ein wiederholter Request mit demselben `(account_id, idempotency_key)` führt keinen zweiten Buchungseffekt aus und liefert den persistierten HTTP-Status sowie den **byte-identischen** Response-Body zurück (ergänzt um den informativen Header `Idempotency-Replayed: true`).
-3. **Nur `2xx` wird gecacht:** Ablehnungen (`400`, `404`, `422`) rollen die Transaktion zurück und werden **nicht** in `idempotency_keys` gespeichert (zusätzlich durch `CHECK (response_status BETWEEN 200 AND 299)` in PostgreSQL erzwungen). Ein korrigierter Retry mit demselben Schlüssel wird danach regulär verarbeitet.
-4. **Gleichzeitige Requests mit identischem Schlüssel:** Treffen parallele Requests mit demselben `(account_id, idempotency_key)` ein, gewinnt genau eine Transaktion über den Unique-Index bzw. das optimistische Locking. Verlierer-Requests lesen die gespeicherte Antwort des Gewinners und liefern sie byte-gleich zurück — **kein `409 Conflict`**.
-5. **Lock-Timeout-Schutz (`lock_timeout = 3s`):** Blockiert ein konkurrierender Request am Unique-Index oder Zeilen-Lock länger als `3s` (z. B. durch eine langsame Gewinner-Transaktion), bricht PostgreSQL mit `SQLSTATE 55P03` ab. Die API übersetzt dies in HTTP **`503 Service Unavailable`** mit Header **`Retry-After: 1`** (RFC 7807 `errorCode: LOCK_TIMEOUT`), sodass kein Request-Thread unbegrenzt hängt.
+1. **Atomare Persistenz & Payload-Fingerprint:** Statuscode, serialisierter JSON-Response-Body und `request_fingerprint` (`CHAR(64)`, SHA-256 über die kanonischen Geschäftsfelder `accountId`, `type`, normalisierter `amount`, `currency`, `reference` — **nicht** über den rohen JSON-Body) werden in derselben Datenbanktransaktion wie die Konto- und Buchungsänderung in `idempotency_keys` persistiert.
+2. **Byte-gleiches Replay (gleicher Fingerprint):** Ein wiederholter Request mit demselben `(account_id, idempotency_key)` **und** identischem `request_fingerprint` führt keinen zweiten Buchungseffekt aus und liefert den persistierten HTTP-Status sowie den **byte-identischen** Response-Body zurück (`Idempotency-Replayed: true`).
+3. **Key-Reuse mit abweichendem Inhalt (`422`):** Wird derselbe `(account_id, idempotency_key)` mit **anderem** Inhalt (abweichender `request_fingerprint`, z. B. anderer Betrag) wiederverwendet, lehnt die API den Request mit HTTP **`422 Unprocessable Entity`** (RFC 7807 `type: urn:ledger-stream:error:idempotency-key-reuse`, `errorCode: IDEMPOTENCY_KEY_REUSE`) ab — keine zweite Buchung, Saldo unverändert.
+4. **Nur `2xx` wird gecacht:** Ablehnungen (`400`, `404`, `422`) rollen die Transaktion zurück und werden **nicht** in `idempotency_keys` gespeichert (`CHECK (response_status BETWEEN 200 AND 299)`).
+5. **Abgrenzung `409` / `503` vs. `422`:**
+   - **Paralleler gleicher Request (gleicher Key & gleicher Inhalt):** Verlierer liest die Antwort des Gewinners und liefert sie byte-gleich zurück. Bei konkurrierendem Konflikt ohne abgelegte Idempotenz-Antwort (Optimistic Locking) entsteht **`409 Conflict`**; überschreitet das Warten auf den Zeilen-/Index-Lock `lock_timeout = 3s` (`SQLSTATE 55P03`), liefert die API **`503 Service Unavailable`** mit `Retry-After: 1` (`LOCK_TIMEOUT`).
+   - **Gleicher Key mit anderem Inhalt:** deterministisch **`422 Unprocessable Entity`** (`urn:ledger-stream:error:idempotency-key-reuse`).
 
 ## Outbox-Betrieb, Metriken & PostgreSQL-Parameter
 
@@ -127,22 +129,27 @@ lock_timeout         = 3s
 - **Token-Lifecycle & Sichtbarkeit:** `automaticSilentRenew`, explizite Re-Login-Ansicht bei abgelaufenem Token (kein leerer Bildschirm), Logout über `end_session_endpoint`, fünf sichtbare Fehlerzustände (`401`, `403`, `422` RFC-7807 Feldfehler, `409`/Idempotenz-Replay, Netzwerk mit Retry) sowie `document.visibilityState`-gesteuertes Polling mit Backoff und `clearInterval` in `onUnmounted`.
 - **Strikte Typisierung:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, ESLint `@typescript-eslint/no-explicit-any: error` und `consistent-type-assertions: never` (0 `any`, 0 `as unknown as X`).
 
-## Ressourcenbudget (gemessene `docker stats` nach Phase 8 + Vorrechnung Phase 9)
+## Observability (Micrometer, Prometheus, Grafana, JSON-Logging & Correlation-ID)
+
+- **Micrometer-Metriken (`/actuator/prometheus`, strikt begrenzte Kardinalität):** Ausschließlich geschlossene Label-Mengen (`outcome`, `reason`, `type`, `result`) — **niemals** `accountId`, `eventId`, `correlationId` oder Beträge als Metrik-Tag. Exponiert u. a. `outbox_unsent`, `outbox_oldest_pending_age_seconds`, `outbox_events_failed_total`, `outbox_events_relayed_total{type,result}`, `consumer_processed_total{outcome}`, `consumer_duplicates_rejected_total{reason}`, `consumer_retries_total`, `dlq_entries_unhandled`, `dlq_replayed_total`, `http_server_requests_seconds` (inkl. Histogram-Buckets).
+- **Prometheus & Grafana (Zero-Click-Provisioning):** [observability/prometheus.yml](observability/prometheus.yml) scrapt `app:8080/actuator/prometheus` und `keycloak:9000/metrics` mit `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression`. [observability/grafana/provisioning/datasources/prometheus.yml](observability/grafana/provisioning/datasources/prometheus.yml) provisioniert die Datasource mit fester `uid: prometheus`; [observability/grafana/dashboards/ledger-stream.json](observability/grafana/dashboards/ledger-stream.json) (`uid: ledger-stream-overview`, 7 Panels inkl. roter 300s-Schwelle auf `outbox_oldest_pending_age_seconds`) referenziert diese UID ohne `__inputs`.
+- **Strukturiertes JSON-Logging & 3-stufige Correlation-ID:** [logback-spring.xml](app/src/main/resources/logback-spring.xml) (`logstash-logback-encoder`) schreibt flaches JSON (`ts`, `level`, `logger`, `message`, `correlationId`, `eventId` nur im Event-Kontext; keine Tokens, `Authorization`-Header oder Roh-Payloads). `CorrelationIdFilter` validiert eingehende `X-Correlation-Id` strikt gegen `^[A-Za-z0-9._-]{8,64}$` (ungültige Werte werden verworfen, mit neuer UUID ersetzt und `correlationIdRejected=true` geloggt), persistiert sie in `outbox_events.correlation_id`, überträgt sie per Kafka-Header in den Consumer (`MDC` + `finally MDC.clear()`) und erhält sie beim DLQ-Replay.
+
+## Ressourcenbudget (gemessene `docker stats` nach Phase 9 — ALLE 8 Container)
 
 Keycloak 26 läuft mit `start --optimized --import-realm`, `-Xmx256m`, `KC_CACHE=local` auf der **bestehenden** PostgreSQL-16-Instanz (eigene Datenbank `keycloak`, kein H2, kein Dev-Mode). Nach dem Lastlauf in Phase 10 wird Keycloak erneut vermessen (`RSS > 450 MiB` → `-Xmx320m`).
 
 | Container | Limit | Tuning | Gemessener RSS | Auslastung |
 |---|---:|---|---:|---:|
-| `ledger-stream-postgres` | `320 MiB` | `shared_buffers=64MB`, `work_mem=4MB`, `lock_timeout=3s` (DBs: `ledger` + `keycloak`) | `22,02 MiB` | `6,88 %` |
-| `ledger-stream-kafka` | `448 MiB` | KRaft, `-Xms128m -Xmx192m`, `dedupe_buffer=16MB` | `201,40 MiB` | `44,96 %` |
-| `ledger-stream-schema-registry` | `384 MiB` | `FULL`, `-Xmx192m -XX:MaxMetaspaceSize=96m` | `221,80 MiB` | `57,76 %` |
-| `ledger-stream-keycloak` | `640 MiB` | `start --optimized`, `KC_DB=postgres`, `KC_CACHE=local`, `-Xms128m -Xmx256m` | `347,50 MiB` | `54,30 %` |
-| `ledger-stream-frontend` | `48 MiB` | `nginxinc/nginx-unprivileged:1.27-alpine` (statisches Vue-Bundle) | `15,92 MiB` | `33,16 %` |
-| **Summe gemessen (5 Container)** | — | **Zielbudget Gesamtstack: `1536 MiB` (1,5 GiB)** | **`808,64 MiB`** | **Puffer: `727,36 MiB`** |
-| _Phase 9/11 Vorausberechnung:_ `ledger-stream-app` | `384 MiB` | `-XX:MaxRAMPercentage=65` | _~220–260 MiB_ | — |
-| _Phase 9 Vorausberechnung:_ `prometheus` | `192 MiB` | `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression` | _~60–90 MiB_ | — |
-| _Phase 9 Vorausberechnung:_ `grafana` | `192 MiB` | `GF_INSTALL_PLUGINS=""`, `GF_ANALYTICS_CHECK_FOR_UPDATES=false` | _~80–110 MiB_ | — |
-| **Gesamtstack-Prognose (8 Container)** | — | **Zielkorridor: 200–300 MiB Puffer in `1536 MiB`** | **_~1269 MiB_** | **_~267 MiB Puffer_** |
+| `ledger-stream-postgres` | `320 MiB` | `shared_buffers=64MB`, `work_mem=4MB`, `lock_timeout=3s` (DBs: `ledger` + `keycloak`) | `31,21 MiB` | `9,75 %` |
+| `ledger-stream-kafka` | `448 MiB` | KRaft, `-Xms128m -Xmx192m`, `dedupe_buffer=16MB` | `217,50 MiB` | `48,56 %` |
+| `ledger-stream-schema-registry` | `384 MiB` | `FULL`, `-Xmx192m -XX:MaxMetaspaceSize=96m` | `209,00 MiB` | `54,43 %` |
+| `ledger-stream-keycloak` | `640 MiB` | `start --optimized`, `KC_DB=postgres`, `KC_CACHE=local`, `KC_METRICS_ENABLED=true`, `-Xms128m -Xmx256m` | `331,20 MiB` | `51,75 %` |
+| `ledger-stream-app` | `384 MiB` | Java 21 JRE, `-XX:MaxRAMPercentage=65.0 -XX:+UseG1GC` | `232,20 MiB` | `60,46 %` |
+| `ledger-stream-frontend` | `48 MiB` | `nginxinc/nginx-unprivileged:1.27-alpine` (statisches Vue-Bundle) | `16,73 MiB` | `34,85 %` |
+| `ledger-stream-prometheus` | `192 MiB` | `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression` | `21,19 MiB` | `11,04 %` |
+| `ledger-stream-grafana` | `192 MiB` | `GF_INSTALL_PLUGINS=""`, `GF_ANALYTICS_CHECK_FOR_UPDATES=false` | `71,52 MiB` | `37,25 %` |
+| **Summe gemessen (alle 8 Container)** | — | **Zielbudget Gesamtstack: `1536 MiB` (1,5 GiB)** | **`1130,55 MiB`** | **Puffer: `405,45 MiB`** |
 
 ## Schema-Evolution (Avro + Confluent Schema Registry)
 
