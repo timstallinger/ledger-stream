@@ -5,14 +5,13 @@ metadata:
   namespace: ledger-stream
 spec:
   hard:
-    # Realistic budget derived directly from F1 1.5-vCPU 100k cgroup memory.stat anon peaks (sum = 1637.44 MiB).
-    # Pod requests sum to 1728Mi RAM (quota 1792Mi = 1.75 GiB) and exactly 1500m CPU (1.50 vCPU).
-    # Limits sum to 2864Mi (1.66x overcommit): limits are upper bounds for reclaimable page cache and
-    # non-simultaneous JVM bursts, not reservations.
-    requests.memory: 1792Mi
-    requests.cpu: 1500m
-    limits.memory: 2944Mi
-    limits.cpu: 4000m
+    # Nominal pod requests (= real budget from F1 1.5-vCPU anon peaks): 1500m CPU / 1728Mi RAM.
+    # Quota hard values = nominal budget + surge headroom for one RollingUpdate app pod (500m / 512Mi,
+    # limits 1000m / 640Mi) in the prod overlay. Hard is NOT a second budget.
+    requests.cpu: 2000m
+    requests.memory: 2304Mi
+    limits.cpu: 5000m
+    limits.memory: 3584Mi
     pods: "20"
 ---
 apiVersion: v1
