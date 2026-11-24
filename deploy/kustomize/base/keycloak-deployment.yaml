@@ -1,11 +1,32 @@
-# Example Kubernetes envFrom / secretKeyRef binding for Keycloak runtime secrets.
-# Actual Secret objects are never committed in plaintext (Sealed Secrets follow in Phase 11).
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: ledger-stream
+  labels:
+    app: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: management
+      port: 9000
+      targetPort: 9000
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: keycloak
+  namespace: ledger-stream
+  labels:
+    app: keycloak
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: keycloak
@@ -14,6 +35,14 @@ spec:
       labels:
         app: keycloak
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 0
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: keycloak
           image: ghcr.io/timstallinger/ledger-stream-keycloak:26.2.5
@@ -21,44 +50,103 @@ spec:
             - start
             - --optimized
             - --import-realm
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: 9000
           env:
             - name: KC_DB
               value: postgres
             - name: KC_CACHE
               value: local
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_METRICS_ENABLED
+              value: "true"
             - name: KC_DB_URL
               value: jdbc:postgresql://postgres:5432/keycloak
             - name: KC_DB_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: ledger-stream-db-secret
-                  key: username
+                  name: ledger-stream-db-creds
+                  key: db-user
             - name: KC_DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: ledger-stream-db-secret
-                  key: password
+                  name: ledger-stream-db-creds
+                  key: db-pass
             - name: KC_BOOTSTRAP_ADMIN_USERNAME
               valueFrom:
                 secretKeyRef:
-                  name: keycloak-secrets
-                  key: admin-username
+                  name: keycloak-creds
+                  key: admin-user
             - name: KC_BOOTSTRAP_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: keycloak-secrets
-                  key: admin-password
+                  name: keycloak-creds
+                  key: admin-pass
             - name: LEDGER_CLI_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: keycloak-secrets
-                  key: cli-client-secret
+                  name: keycloak-creds
+                  key: cli-cred
             - name: JAVA_OPTS_APPEND
               value: "-Xms128m -Xmx256m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
-              memory: 256Mi
+              memory: 320Mi
               cpu: 100m
             limits:
               memory: 640Mi
               cpu: 350m
+          startupProbe:
+            httpGet:
+              path: /health/started
+              port: 9000
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9000
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: realm-template
+              mountPath: /opt/keycloak/data/import-template
+              readOnly: true
+            - name: realm-import
+              mountPath: /opt/keycloak/data/import
+            - name: kc-tmp
+              mountPath: /opt/keycloak/data/tmp
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: realm-template
+          configMap:
+            name: keycloak-realm-template
+        - name: realm-import
+          emptyDir: {}
+        - name: kc-tmp
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  namespace: ledger-stream
+  labels:
+    app: app
+spec:
+  selector:
+    app: app
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: ledger-stream
+  labels:
+    app: app
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: ghcr.io/timstallinger/ledger-stream-app:0.1.0
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: ledger-stream-config
+          env:
+            - name: DB_URL
+              value: jdbc:postgresql://postgres:5432/ledger
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-stream-db-creds
+                  key: db-user
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-stream-db-creds
+                  key: db-pass
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:29092
+            - name: SCHEMA_REGISTRY_URL
+              value: http://schema-registry:8081
+            - name: JAVA_OPTS
+              value: "-XX:MaxRAMPercentage=55.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: 416Mi
+              cpu: 500m
+            limits:
+              memory: 640Mi
+              cpu: 1000m
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

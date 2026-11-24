@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: schema-registry
+  namespace: ledger-stream
+  labels:
+    app: schema-registry
+spec:
+  selector:
+    app: schema-registry
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: schema-registry
+  namespace: ledger-stream
+  labels:
+    app: schema-registry
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: schema-registry
+  template:
+    metadata:
+      labels:
+        app: schema-registry
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: seed-etc-schema-registry
+          image: confluentinc/cp-schema-registry:7.9.9
+          command: ["sh", "-c", "cp -a /etc/schema-registry/. /writable-etc/"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 25m
+            limits:
+              memory: 64Mi
+              cpu: 100m
+          volumeMounts:
+            - name: etc-sr
+              mountPath: /writable-etc
+      containers:
+        - name: schema-registry
+          image: confluentinc/cp-schema-registry:7.9.9
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: SCHEMA_REGISTRY_HOST_NAME
+              value: schema-registry
+            - name: SCHEMA_REGISTRY_LISTENERS
+              value: http://0.0.0.0:8081
+            - name: SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS
+              value: PLAINTEXT://kafka:29092
+            - name: SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: ledger-stream-config
+                  key: SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL
+            - name: SCHEMA_REGISTRY_HEAP_OPTS
+              value: "-Xmx192m -XX:MaxMetaspaceSize=96m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: 208Mi
+              cpu: 100m
+            limits:
+              memory: 384Mi
+              cpu: 250m
+          startupProbe:
+            httpGet:
+              path: /subjects
+              port: 8081
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /subjects
+              port: 8081
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8081
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: etc-sr
+              mountPath: /etc/schema-registry
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: etc-sr
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
