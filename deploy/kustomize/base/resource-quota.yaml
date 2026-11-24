@@ -5,10 +5,11 @@ metadata:
   namespace: ledger-stream
 spec:
   hard:
-    # Hard enforcement of the 1.5 GiB / 1.5 vCPU working-set budget on requests (M2 measured anon = 1515.87 MiB).
-    # Sum of container limits is intentionally higher (~2864 MiB = 1.86x overcommit) to accommodate reclaimable
-    # PostgreSQL/Kafka page cache and non-simultaneous JVM bursts (documented in README.md).
-    requests.memory: 1536Mi
+    # Realistic budget derived directly from F1 1.5-vCPU 100k cgroup memory.stat anon peaks (sum = 1637.44 MiB).
+    # Pod requests sum to 1728Mi RAM (quota 1792Mi = 1.75 GiB) and exactly 1500m CPU (1.50 vCPU).
+    # Limits sum to 2864Mi (1.66x overcommit): limits are upper bounds for reclaimable page cache and
+    # non-simultaneous JVM bursts, not reservations.
+    requests.memory: 1792Mi
     requests.cpu: 1500m
     limits.memory: 2944Mi
     limits.cpu: 4000m

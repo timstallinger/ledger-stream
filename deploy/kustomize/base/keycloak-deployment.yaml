@@ -96,7 +96,7 @@ spec:
                   name: keycloak-creds
                   key: cli-cred
             - name: JAVA_OPTS_APPEND
-              value: "-Xms128m -Xmx256m"
+              value: "-Xms128m -Xmx224m"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -104,11 +104,11 @@ spec:
               drop: ["ALL"]
           resources:
             requests:
-              memory: 320Mi
-              cpu: 100m
+              memory: 480Mi
+              cpu: 300m
             limits:
               memory: 640Mi
-              cpu: 350m
+              cpu: 500m
           startupProbe:
             httpGet:
               path: /health/started
