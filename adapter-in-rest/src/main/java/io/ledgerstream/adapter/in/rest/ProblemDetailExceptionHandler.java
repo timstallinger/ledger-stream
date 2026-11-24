@@ -6,6 +6,7 @@ import io.ledgerstream.domain.exception.BookingNotFoundException;
 import io.ledgerstream.domain.exception.DlqEntryAlreadyReplayedException;
 import io.ledgerstream.domain.exception.DlqEntryNotFoundException;
 import io.ledgerstream.domain.exception.DuplicateAccountNumberException;
+import io.ledgerstream.domain.exception.IdempotencyKeyReuseException;
 import io.ledgerstream.domain.exception.InvalidDomainValueException;
 import io.ledgerstream.domain.exception.LockTimeoutException;
 import io.ledgerstream.domain.exception.OptimisticLockConflictException;
@@ -80,6 +81,22 @@ public final class ProblemDetailExceptionHandler {
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                 .header(HttpHeaders.RETRY_AFTER, "1")
                 .body(problem);
+    }
+
+    @ExceptionHandler(IdempotencyKeyReuseException.class)
+    public ProblemDetail handleIdempotencyKeyReuse(
+            final IdempotencyKeyReuseException exception,
+            final HttpServletRequest request
+    ) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                HttpStatus.UNPROCESSABLE_ENTITY,
+                exception.getMessage()
+        );
+        problem.setType(URI.create(ERROR_TYPE_PREFIX + "idempotency-key-reuse"));
+        problem.setTitle("Idempotency key reused with different payload");
+        problem.setInstance(URI.create(request.getRequestURI()));
+        problem.setProperty("errorCode", exception.errorCode());
+        return problem;
     }
 
     @ExceptionHandler(DomainException.class)

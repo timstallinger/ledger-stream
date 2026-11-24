@@ -223,6 +223,66 @@ final class AccountBookingApiIT {
     }
 
     @Test
+    void reusedIdempotencyKeyWithDifferentAmountReturns422AndPreservesSingleBookingAndBalance() throws Exception {
+        String accountNumber = "DE-" + UUID.randomUUID().toString().substring(0, 8);
+        String accountId = createAccount(accountNumber, "EUR");
+        String sharedKey = "idem-reuse-" + accountNumber;
+
+        ResponseEntity<String> first = postBooking(
+                accountId,
+                "CREDIT",
+                "50.00",
+                "EUR",
+                "Invoice 100",
+                sharedKey
+        );
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        // (a) Same Idempotency-Key with DIFFERENT amount -> 422 urn:ledger-stream:error:idempotency-key-reuse
+        ResponseEntity<String> mismatched = postBooking(
+                accountId,
+                "CREDIT",
+                "99.99",
+                "EUR",
+                "Invoice 100",
+                sharedKey
+        );
+        assertThat(mismatched.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        JsonNode problem = objectMapper.readTree(mismatched.getBody());
+        assertThat(problem.get("status").asInt()).isEqualTo(422);
+        assertThat(problem.get("type").asText()).isEqualTo("urn:ledger-stream:error:idempotency-key-reuse");
+        assertThat(problem.get("errorCode").asText()).isEqualTo("IDEMPOTENCY_KEY_REUSE");
+
+        Integer bookingCountAfterMismatch = jdbcClient.sql("SELECT COUNT(*) FROM bookings WHERE account_id = :id")
+                .param("id", UUID.fromString(accountId))
+                .query(Integer.class)
+                .single();
+        assertThat(bookingCountAfterMismatch).isEqualTo(1);
+
+        ResponseEntity<String> accountAfterMismatch = getAuthorized("/api/v1/accounts/" + accountId);
+        assertThat(new BigDecimal(objectMapper.readTree(accountAfterMismatch.getBody()).get("balance").asText()))
+                .isEqualByComparingTo("50.00");
+
+        System.out.println("N1_KEY_REUSE_422: status=" + mismatched.getStatusCode().value()
+                + " dbBookingCount=" + bookingCountAfterMismatch
+                + " balance=50.00"
+                + " body=" + mismatched.getBody());
+
+        // (b) Same Idempotency-Key with IDENTICAL normalized payload ("50.0" == "50.00") -> 201 + Replay-Header
+        ResponseEntity<String> identicalRetry = postBooking(
+                accountId,
+                "CREDIT",
+                "50.0",
+                "EUR",
+                "Invoice 100",
+                sharedKey
+        );
+        assertThat(identicalRetry.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(identicalRetry.getHeaders().getFirst("Idempotency-Replayed")).isEqualTo("true");
+        assertThat(identicalRetry.getBody()).isEqualTo(first.getBody());
+    }
+
+    @Test
     void concurrentIdenticalIdempotencyRequestsReturnByteIdenticalWinnerResponseWithout409() throws Exception {
         String accountNumber = "DE-" + UUID.randomUUID().toString().substring(0, 8);
         String accountId = createAccount(accountNumber, "EUR");

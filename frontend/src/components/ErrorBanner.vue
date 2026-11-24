@@ -38,7 +38,12 @@ const emit = defineEmits<{
 
     <template v-else-if="error.kind === 'validation'">
       <div class="error-banner__header">
-        <strong>{{ error.status }} — Validierungs-/Regelfehler ({{ error.errorCode }})</strong>
+        <strong v-if="error.errorCode === 'IDEMPOTENCY_KEY_REUSE'">
+          422 — Idempotency-Key mit abweichendem Inhalt wiederverwendet
+        </strong>
+        <strong v-else>
+          {{ error.status }} — Validierungs-/Regelfehler ({{ error.errorCode }})
+        </strong>
       </div>
       <p>{{ error.message }}</p>
       <ul v-if="error.fieldErrors.length > 0" class="error-banner__fields">

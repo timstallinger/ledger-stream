@@ -9,12 +9,13 @@ import java.util.Optional;
 
 public interface IdempotencyStore {
 
-    Optional<StoredIdempotentResponse> find(AccountId accountId, IdempotencyKey idempotencyKey);
+    Optional<IdempotencyRecord> find(AccountId accountId, IdempotencyKey idempotencyKey);
 
     void save(
             AccountId accountId,
             IdempotencyKey idempotencyKey,
             BookingId bookingId,
+            String requestFingerprint,
             StoredIdempotentResponse response
     );
 }

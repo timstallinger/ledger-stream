@@ -8,6 +8,7 @@ import io.ledgerstream.application.port.in.StoredIdempotentResponse;
 import io.ledgerstream.application.port.out.AccountRepository;
 import io.ledgerstream.application.port.out.BookingRepository;
 import io.ledgerstream.application.port.out.DuplicateIdempotencyKeyException;
+import io.ledgerstream.application.port.out.IdempotencyRecord;
 import io.ledgerstream.application.port.out.IdempotencyStore;
 import io.ledgerstream.application.port.out.OutboxEvent;
 import io.ledgerstream.application.port.out.OutboxPayloadSerializer;
@@ -15,6 +16,7 @@ import io.ledgerstream.application.port.out.OutboxRepository;
 import io.ledgerstream.application.port.out.OutboxStatus;
 import io.ledgerstream.application.port.out.PendingOutboxCandidate;
 import io.ledgerstream.application.port.out.TransactionRunner;
+import io.ledgerstream.domain.exception.IdempotencyKeyReuseException;
 import io.ledgerstream.domain.exception.InsufficientBalanceException;
 import io.ledgerstream.domain.exception.OptimisticLockConflictException;
 import io.ledgerstream.domain.model.Account;
@@ -159,19 +161,62 @@ final class BookingServiceTest {
     }
 
     @Test
+    void rejectsReusedIdempotencyKeyWithDifferentPayloadAndPreservesBalance() {
+        Account account = accountService.execute(new CreateAccountCommand(AccountNumber.of("DE-2009"), EUR));
+        IdempotencyKey sharedKey = IdempotencyKey.of("idem-reuse-mismatch");
+
+        bookingService.execute(
+                new CreateBookingCommand(
+                        account.id(),
+                        BookingType.CREDIT,
+                        Money.of(new BigDecimal("50.00"), EUR),
+                        Reference.of("Original payment"),
+                        sharedKey
+                ),
+                exec -> new StoredIdempotentResponse(201, "{\"id\":\"" + exec.booking().id().value() + "\"}")
+        );
+
+        CreateBookingCommand mutatedPayload = new CreateBookingCommand(
+                account.id(),
+                BookingType.CREDIT,
+                Money.of(new BigDecimal("99.00"), EUR),
+                Reference.of("Original payment"),
+                sharedKey
+        );
+
+        assertThatThrownBy(() -> bookingService.execute(
+                mutatedPayload,
+                exec -> new StoredIdempotentResponse(201, "{\"should\":\"never-run\"}")
+        )).isInstanceOf(IdempotencyKeyReuseException.class);
+
+        assertThat(accountRepository.findById(account.id()).orElseThrow().balance())
+                .isEqualTo(Money.of(new BigDecimal("50.00"), EUR));
+        assertThat(bookingRepository.findByAccountId(account.id())).hasSize(1);
+        assertThat(outboxRepository.savedEvents).hasSize(1);
+    }
+
+    @Test
     void concurrentLoserOnUniqueViolationReturnsWinnersStoredResponseWithoutConflict() {
         Account account = accountService.execute(new CreateAccountCommand(AccountNumber.of("DE-2003"), EUR));
         IdempotencyKey key = IdempotencyKey.of("idem-race-1");
+        CreateBookingCommand raceCommand = new CreateBookingCommand(
+                account.id(),
+                BookingType.CREDIT,
+                Money.of(new BigDecimal("25.00"), EUR),
+                Reference.of("Race"),
+                key
+        );
+        String winnerFingerprint = RequestFingerprint.forCreateBooking(raceCommand);
         StoredIdempotentResponse winnerResponse = new StoredIdempotentResponse(201, "{\"winner\":true}");
         AtomicBoolean simulateRace = new AtomicBoolean(true);
 
         IdempotencyStore racingStore = new IdempotencyStore() {
             @Override
-            public Optional<StoredIdempotentResponse> find(final AccountId accountId, final IdempotencyKey idempotencyKey) {
+            public Optional<IdempotencyRecord> find(final AccountId accountId, final IdempotencyKey idempotencyKey) {
                 if (simulateRace.get()) {
                     return Optional.empty();
                 }
-                return Optional.of(winnerResponse);
+                return Optional.of(new IdempotencyRecord(winnerFingerprint, winnerResponse));
             }
 
             @Override
@@ -179,6 +224,7 @@ final class BookingServiceTest {
                     final AccountId accountId,
                     final IdempotencyKey idempotencyKey,
                     final BookingId bookingId,
+                    final String requestFingerprint,
                     final StoredIdempotentResponse response
             ) {
                 simulateRace.set(false);
@@ -202,13 +248,7 @@ final class BookingServiceTest {
         );
 
         IdempotentExecutionResult result = racingService.execute(
-                new CreateBookingCommand(
-                        account.id(),
-                        BookingType.CREDIT,
-                        Money.of(new BigDecimal("25.00"), EUR),
-                        Reference.of("Race"),
-                        key
-                ),
+                raceCommand,
                 exec -> new StoredIdempotentResponse(201, "{\"loser\":true}")
         );
 
@@ -332,10 +372,10 @@ final class BookingServiceTest {
     }
 
     private static final class InMemoryIdempotencyStore implements IdempotencyStore {
-        private final Map<String, StoredIdempotentResponse> store = new HashMap<>();
+        private final Map<String, IdempotencyRecord> store = new HashMap<>();
 
         @Override
-        public Optional<StoredIdempotentResponse> find(final AccountId accountId, final IdempotencyKey key) {
+        public Optional<IdempotencyRecord> find(final AccountId accountId, final IdempotencyKey key) {
             return Optional.ofNullable(store.get(accountId.value() + "::" + key.value()));
         }
 
@@ -344,13 +384,14 @@ final class BookingServiceTest {
                 final AccountId accountId,
                 final IdempotencyKey key,
                 final BookingId bookingId,
+                final String requestFingerprint,
                 final StoredIdempotentResponse response
         ) {
             String composite = accountId.value() + "::" + key.value();
             if (store.containsKey(composite)) {
                 throw new DuplicateIdempotencyKeyException(accountId, key);
             }
-            store.put(composite, response);
+            store.put(composite, new IdempotencyRecord(requestFingerprint, response));
         }
     }
 

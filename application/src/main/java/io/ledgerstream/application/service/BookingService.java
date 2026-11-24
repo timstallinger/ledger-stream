@@ -11,6 +11,7 @@ import io.ledgerstream.application.port.in.StoredIdempotentResponse;
 import io.ledgerstream.application.port.out.AccountRepository;
 import io.ledgerstream.application.port.out.BookingRepository;
 import io.ledgerstream.application.port.out.DuplicateIdempotencyKeyException;
+import io.ledgerstream.application.port.out.IdempotencyRecord;
 import io.ledgerstream.application.port.out.IdempotencyStore;
 import io.ledgerstream.application.port.out.OutboxEvent;
 import io.ledgerstream.application.port.out.OutboxPayloadSerializer;
@@ -20,6 +21,7 @@ import io.ledgerstream.domain.event.BookingCancelledEvent;
 import io.ledgerstream.domain.event.BookingCreatedEvent;
 import io.ledgerstream.domain.exception.AccountNotFoundException;
 import io.ledgerstream.domain.exception.BookingNotFoundException;
+import io.ledgerstream.domain.exception.IdempotencyKeyReuseException;
 import io.ledgerstream.domain.exception.OptimisticLockConflictException;
 import io.ledgerstream.domain.model.Account;
 import io.ledgerstream.domain.model.AccountId;
@@ -75,10 +77,12 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
         Objects.requireNonNull(command, "command must not be null");
         Objects.requireNonNull(responseSerializer, "responseSerializer must not be null");
 
+        String fingerprint = RequestFingerprint.forCreateBooking(command);
         return executeIdempotently(
                 command.accountId(),
                 command.idempotencyKey(),
-                () -> executeNewBooking(command, responseSerializer)
+                fingerprint,
+                () -> executeNewBooking(command, fingerprint, responseSerializer)
         );
     }
 
@@ -90,10 +94,12 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
         Objects.requireNonNull(command, "command must not be null");
         Objects.requireNonNull(responseSerializer, "responseSerializer must not be null");
 
+        String fingerprint = RequestFingerprint.forCancelBooking(command);
         return executeIdempotently(
                 command.accountId(),
                 command.idempotencyKey(),
-                () -> executeCancellation(command, responseSerializer)
+                fingerprint,
+                () -> executeCancellation(command, fingerprint, responseSerializer)
         );
     }
 
@@ -108,14 +114,15 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
     private IdempotentExecutionResult executeIdempotently(
             final AccountId accountId,
             final IdempotencyKey idempotencyKey,
+            final String expectedFingerprint,
             final Supplier<IdempotentExecutionResult> transactionalWork
     ) {
         try {
             return transactionRunner.executeInTransaction(transactionalWork);
         } catch (DuplicateIdempotencyKeyException | OptimisticLockConflictException raceException) {
-            Optional<StoredIdempotentResponse> winner = idempotencyStore.find(accountId, idempotencyKey);
+            Optional<IdempotencyRecord> winner = idempotencyStore.find(accountId, idempotencyKey);
             if (winner.isPresent()) {
-                return new IdempotentExecutionResult(winner.get(), true);
+                return verifyFingerprintOrThrow(accountId, idempotencyKey, expectedFingerprint, winner.get());
             }
             throw raceException;
         }
@@ -123,14 +130,15 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
 
     private IdempotentExecutionResult executeNewBooking(
             final CreateBookingCommand command,
+            final String fingerprint,
             final Function<BookingExecution, StoredIdempotentResponse> responseSerializer
     ) {
-        Optional<StoredIdempotentResponse> existing = idempotencyStore.find(
+        Optional<IdempotencyRecord> existing = idempotencyStore.find(
                 command.accountId(),
                 command.idempotencyKey()
         );
         if (existing.isPresent()) {
-            return new IdempotentExecutionResult(existing.get(), true);
+            return verifyFingerprintOrThrow(command.accountId(), command.idempotencyKey(), fingerprint, existing.get());
         }
 
         Account account = accountRepository.findById(command.accountId())
@@ -158,25 +166,26 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
                 now
         );
         String serializedPayload = outboxPayloadSerializer.serialize(event);
-        outboxRepository.save(OutboxEvent.pending(event, serializedPayload, null, now));
+        outboxRepository.save(OutboxEvent.pending(event, serializedPayload, command.correlationId(), now));
 
         StoredIdempotentResponse storedResponse = responseSerializer.apply(
                 new BookingExecution(booking, updatedAccount, event)
         );
-        idempotencyStore.save(account.id(), command.idempotencyKey(), booking.id(), storedResponse);
+        idempotencyStore.save(account.id(), command.idempotencyKey(), booking.id(), fingerprint, storedResponse);
         return new IdempotentExecutionResult(storedResponse, false);
     }
 
     private IdempotentExecutionResult executeCancellation(
             final CancelBookingCommand command,
+            final String fingerprint,
             final Function<BookingExecution, StoredIdempotentResponse> responseSerializer
     ) {
-        Optional<StoredIdempotentResponse> existing = idempotencyStore.find(
+        Optional<IdempotencyRecord> existing = idempotencyStore.find(
                 command.accountId(),
                 command.idempotencyKey()
         );
         if (existing.isPresent()) {
-            return new IdempotentExecutionResult(existing.get(), true);
+            return verifyFingerprintOrThrow(command.accountId(), command.idempotencyKey(), fingerprint, existing.get());
         }
 
         Account account = accountRepository.findById(command.accountId())
@@ -205,12 +214,30 @@ public final class BookingService implements CreateBookingUseCase, CancelBooking
                 now
         );
         String serializedPayload = outboxPayloadSerializer.serialize(event);
-        outboxRepository.save(OutboxEvent.pending(event, serializedPayload, null, now));
+        outboxRepository.save(OutboxEvent.pending(event, serializedPayload, command.correlationId(), now));
 
         StoredIdempotentResponse storedResponse = responseSerializer.apply(
                 new BookingExecution(pair.counterBooking(), updatedAccount, event)
         );
-        idempotencyStore.save(account.id(), command.idempotencyKey(), pair.counterBooking().id(), storedResponse);
+        idempotencyStore.save(
+                account.id(),
+                command.idempotencyKey(),
+                pair.counterBooking().id(),
+                fingerprint,
+                storedResponse
+        );
         return new IdempotentExecutionResult(storedResponse, false);
+    }
+
+    private static IdempotentExecutionResult verifyFingerprintOrThrow(
+            final AccountId accountId,
+            final IdempotencyKey idempotencyKey,
+            final String expectedFingerprint,
+            final IdempotencyRecord existing
+    ) {
+        if (!existing.requestFingerprint().equals(expectedFingerprint)) {
+            throw new IdempotencyKeyReuseException(accountId, idempotencyKey);
+        }
+        return new IdempotentExecutionResult(existing.response(), true);
     }
 }

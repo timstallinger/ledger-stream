@@ -2,6 +2,7 @@ package io.ledgerstream.adapter.out.persistence;
 
 import io.ledgerstream.application.port.in.StoredIdempotentResponse;
 import io.ledgerstream.application.port.out.DuplicateIdempotencyKeyException;
+import io.ledgerstream.application.port.out.IdempotencyRecord;
 import io.ledgerstream.application.port.out.IdempotencyStore;
 import io.ledgerstream.domain.model.AccountId;
 import io.ledgerstream.domain.model.BookingId;
@@ -24,21 +25,24 @@ public final class JdbcIdempotencyStore implements IdempotencyStore {
     }
 
     @Override
-    public Optional<StoredIdempotentResponse> find(
+    public Optional<IdempotencyRecord> find(
             final AccountId accountId,
             final IdempotencyKey idempotencyKey
     ) {
         return jdbcClient.sql("""
-                        SELECT response_status, response_body
+                        SELECT request_fingerprint, response_status, response_body
                         FROM idempotency_keys
                         WHERE account_id = :accountId
                           AND idempotency_key = :idempotencyKey
                         """)
                 .param("accountId", accountId.value())
                 .param("idempotencyKey", idempotencyKey.value())
-                .query((rs, rowNum) -> new StoredIdempotentResponse(
-                        rs.getInt("response_status"),
-                        rs.getString("response_body")
+                .query((rs, rowNum) -> new IdempotencyRecord(
+                        rs.getString("request_fingerprint"),
+                        new StoredIdempotentResponse(
+                                rs.getInt("response_status"),
+                                rs.getString("response_body")
+                        )
                 ))
                 .optional();
     }
@@ -48,20 +52,22 @@ public final class JdbcIdempotencyStore implements IdempotencyStore {
             final AccountId accountId,
             final IdempotencyKey idempotencyKey,
             final BookingId bookingId,
+            final String requestFingerprint,
             final StoredIdempotentResponse response
     ) {
         try {
             jdbcClient.sql("""
                             INSERT INTO idempotency_keys (
-                                account_id, idempotency_key, booking_id, response_status, response_body
+                                account_id, idempotency_key, booking_id, request_fingerprint, response_status, response_body
                             )
                             VALUES (
-                                :accountId, :idempotencyKey, :bookingId, :responseStatus, :responseBody
+                                :accountId, :idempotencyKey, :bookingId, :requestFingerprint, :responseStatus, :responseBody
                             )
                             """)
                     .param("accountId", accountId.value())
                     .param("idempotencyKey", idempotencyKey.value())
                     .param("bookingId", bookingId.value())
+                    .param("requestFingerprint", requestFingerprint)
                     .param("responseStatus", response.statusCode())
                     .param("responseBody", response.responseBody())
                     .update();
