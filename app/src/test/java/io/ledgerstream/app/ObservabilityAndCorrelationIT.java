@@ -1,8 +1,9 @@
 package io.ledgerstream.app;
 
 import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.read.ListAppender;
+import ch.qos.logback.core.AppenderBase;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.ledgerstream.adapter.in.rest.CorrelationIdFilter;
@@ -46,6 +47,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -126,7 +128,7 @@ final class ObservabilityAndCorrelationIT {
     @Test
     void propagatesSingleCorrelationIdAcrossHttpRelayAndConsumerAndExposesBoundedPrometheusMetrics() throws Exception {
         Logger ledgerLogger = (Logger) LoggerFactory.getLogger("io.ledgerstream");
-        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        ThreadSafeLogAppender appender = new ThreadSafeLogAppender();
         appender.start();
         ledgerLogger.addAppender(appender);
 
@@ -158,16 +160,19 @@ final class ObservabilityAndCorrelationIT {
             // Stage 2: Relay outbox -> Kafka
             assertThat(relayOutboxUseCase.relayPendingBatch()).isGreaterThanOrEqualTo(1);
 
-            // Stage 3: Wait for Consumer projection
+            // Stage 3: Wait for BOTH Consumer DB projection AND post-ack stage=consumer log event
             AccountId domainAccountId = AccountId.of(UUID.fromString(accountId));
             awaitCondition(
-                    Duration.ofSeconds(15),
+                    Duration.ofSeconds(20),
                     () -> accountSummaryRepository.findByAccountId(domainAccountId)
                             .map(s -> s.bookingCount() == 1L)
                             .orElse(false)
+                            && appender.events().stream().anyMatch(ev ->
+                                    clientCorrelationId.equals(ev.getMDCPropertyMap().get("correlationId"))
+                                            && ev.getFormattedMessage().contains("stage=consumer"))
             );
 
-            List<ILoggingEvent> matchingEvents = appender.list.stream()
+            List<ILoggingEvent> matchingEvents = appender.events().stream()
                     .filter(ev -> clientCorrelationId.equals(ev.getMDCPropertyMap().get("correlationId")))
                     .toList();
 
@@ -235,7 +240,7 @@ final class ObservabilityAndCorrelationIT {
     @Test
     void generatesDistinctCorrelationIdsForTwoConsecutiveBookingsAndRejectsUntrustedHeader() throws Exception {
         Logger filterLogger = (Logger) LoggerFactory.getLogger(CorrelationIdFilter.class);
-        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        ThreadSafeLogAppender appender = new ThreadSafeLogAppender();
         appender.start();
         filterLogger.addAppender(appender);
 
@@ -263,7 +268,7 @@ final class ObservabilityAndCorrelationIT {
             assertThat(replacedCid).isNotNull();
             assertThat(replacedCid).doesNotContain("bad");
             assertThat(CorrelationIdFilter.VALID_PATTERN.matcher(replacedCid).matches()).isTrue();
-            assertThat(appender.list)
+            assertThat(appender.events())
                     .anyMatch(ev -> ev.getFormattedMessage().contains("correlationIdRejected=true")
                             && replacedCid.equals(ev.getMDCPropertyMap().get("correlationId")));
         } finally {
@@ -274,6 +279,7 @@ final class ObservabilityAndCorrelationIT {
 
     private static LoggingEventCompositeJsonEncoder buildJsonEncoder() {
         LoggingEventCompositeJsonEncoder encoder = new LoggingEventCompositeJsonEncoder();
+        encoder.setContext((LoggerContext) LoggerFactory.getILoggerFactory());
         LoggingEventFormattedTimestampJsonProvider ts = new LoggingEventFormattedTimestampJsonProvider();
         ts.setFieldName("ts");
         ts.setTimeZone("UTC");
@@ -351,5 +357,19 @@ final class ObservabilityAndCorrelationIT {
 
     private static String shortId() {
         return UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    private static final class ThreadSafeLogAppender extends AppenderBase<ILoggingEvent> {
+        private final CopyOnWriteArrayList<ILoggingEvent> events = new CopyOnWriteArrayList<>();
+
+        @Override
+        protected void append(final ILoggingEvent eventObject) {
+            eventObject.prepareForDeferredProcessing();
+            events.add(eventObject);
+        }
+
+        List<ILoggingEvent> events() {
+            return events;
+        }
     }
 }
