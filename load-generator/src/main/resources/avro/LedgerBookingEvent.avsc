@@ -1,0 +1,21 @@
+{
+  "type": "record",
+  "name": "LedgerBookingEvent",
+  "namespace": "io.ledgerstream.adapter.out.messaging.avro",
+  "doc": "Canonical ledger booking domain event (v2, FULL-compatible with v1 via default initiationChannel).",
+  "fields": [
+    { "name": "eventId", "type": "string" },
+    { "name": "eventType", "type": "string" },
+    { "name": "aggregateId", "type": "string" },
+    { "name": "bookingId", "type": "string" },
+    { "name": "originalBookingId", "type": ["null", "string"], "default": null },
+    { "name": "bookingType", "type": "string" },
+    { "name": "amount", "type": "string" },
+    { "name": "currency", "type": "string" },
+    { "name": "reference", "type": "string" },
+    { "name": "version", "type": "long" },
+    { "name": "occurredAt", "type": "string" },
+    { "name": "schemaVersion", "type": "int", "default": 2 },
+    { "name": "initiationChannel", "type": "string", "default": "API" }
+  ]
+}

@@ -27,6 +27,7 @@
         <module>adapter-out-persistence</module>
         <module>adapter-out-messaging</module>
         <module>app</module>
+        <module>load-generator</module>
     </modules>
 
     <properties>

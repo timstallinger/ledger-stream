@@ -1,0 +1,21 @@
+# Optional Compose override for Phase 10 load-generator benchmark & SQL invariant checks from host.
+# Keeps all memory limits (mem_limit) 100% identical to docker-compose.yml while exposing
+# PostgreSQL on loopback 5433 and lifting Compose CPU throttling so 6 Kafka partitions,
+# consumer concurrency=6 and 32 HTTP client threads can execute in parallel.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    cpus: 4.0
+  kafka:
+    cpus: 2.0
+  schema-registry:
+    cpus: 1.0
+  keycloak:
+    cpus: 2.0
+  app:
+    cpus: 6.0
+  prometheus:
+    cpus: 1.0
+  grafana:
+    cpus: 1.0
