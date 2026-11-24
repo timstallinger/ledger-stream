@@ -1,225 +1,199 @@
 # ledger-stream
 
-Event-getriebenes Buchungssystem in **Java 21** und **Spring Boot 3.5.x**, das messbar zeigt, wie effektive **Exactly-once-Verarbeitung** zwischen PostgreSQL 16 und Apache Kafka (KRaft) über **Transactional Outbox**, **idempotente Consumer** und **klassifiziertes Fehlerhandling mit DLQ & Replay** hergestellt wird.
+## Problem → Lösung (in 5 Sätzen)
 
-## Problemstellung
+In event-getriebenen Buchungssystemen liegt das eigentliche Konsistenzproblem an der Systemgrenze zwischen relationaler Datenbank und Kafka-Broker: Stürzt der Service nach dem DB-Commit und vor dem Broker-Publish ab, gehen Events verloren; bei Redelivery oder doppelten Client-Requests drohen Doppelbuchungen. `ledger-stream` löst diese Lücke mit **Java 21**, **Spring Boot 3.5.x**, **PostgreSQL 16** und **Apache Kafka 3.9.1 (KRaft)** ohne verdeckende Frameworks (kein Debezium, kein Spring Cloud Stream, kein JPA/Hibernate, kein Lombok). Jede Buchung schreibt Kontoänderung, gecachte Idempotenz-Antwort (`UNIQUE (account_id, idempotency_key)` + SHA-256-Payload-Fingerprint) und Outbox-Event atomar in derselben Datenbanktransaktion; ein Outbox-Relay publiziert per `FOR UPDATE SKIP LOCKED` mindestens einmal nach Kafka. Auf der Leseseite dedupliziert der Consumer über `INSERT INTO processed_events ... ON CONFLICT DO NOTHING` in derselben Transaktion wie das Saldo-Update, während technische Fehler über nicht-blockierende Retry-Topics und fachliche/Deserialisierungs-Fehler mit erhaltenen Rohbytes direkt in die DLQ (`ledger.events.dlq` + `dlq_entries`) laufen. Die vollständige Wirkung — inklusive Security (Keycloak 26 OIDC), Observability (Prometheus/Grafana), reproduzierbarem 100.000-Buchungen-Lasttest und GitOps-Deployment (k3s, Kustomize, ArgoCD, Cosign/SBOM) — ist über automatisierte Integrationstests und harte DB-Invarianten nachgewiesen.
 
-Der schwierige Teil event-getriebener Systeme ist nicht das Produzieren einer Kafka-Nachricht. Die eigentliche Konsistenzaufgabe liegt an der Systemgrenze zwischen relationaler Datenbank und Broker:
+## Architektur (Kontext & Container)
 
-- **Absturz nach DB-Commit, vor Kafka-Publish** → Buchung existiert, Event fehlt (Datenverlust im Downstream).
-- **Absturz nach Kafka-Publish, vor Bestätigung / Redelivery** → Event kommt mehrfach an (Doppelbuchung ohne Idempotenz).
-- **Doppelter Client-Request bei Netzwerk-Timeout** → ohne expliziten `Idempotency-Key` entsteht eine doppelte Buchung.
+Die vollständige Architektur inklusive Hexagonal-Schnitt und End-to-End-Sequenzdiagramm liegt in [docs/architecture.md](docs/architecture.md).
 
-`ledger-stream` löst diese Probleme explizit und ohne verdeckende Bibliotheken (kein Debezium, kein Spring Cloud Stream, kein Axon, kein Lombok, kein JPA/Hibernate).
-
-## Effektive Exactly-once-Semantik
-
-In einem verteilten System aus PostgreSQL und Kafka existiert kein magisches „Exactly-once-Delivery“ über die Netzwerkgrenze. `ledger-stream` trennt deshalb bewusst drei Schichten:
-
-| Schicht | Garantie | Mechanismus in `ledger-stream` |
-|---|---|---|
-| **Zustellung (Delivery)** | **At-least-once** | Transactional Outbox (`FOR UPDATE SKIP LOCKED`, Batch 500) publiziert nach Commit; Absturz zwischen Kafka-Ack und `markSent` führt zu erneutem Publish. |
-| **Verarbeitung (Processing)** | **At-least-once** | Manuelles Offset-Commit erst nach DB-Commit; Absturz zwischen DB-Commit und Offset-Commit sowie Non-Blocking Retry Topics liefern Records erneut aus. |
-| **Wirkung (Effect)** | **Genau einmal (Exactly-once)** | Schreibseite: `UNIQUE (account_id, idempotency_key)` + byte-gleiches Replay gecachter `2xx`-Antworten. Leseseite: `INSERT INTO processed_events ... ON CONFLICT DO NOTHING` in derselben Transaktion wie das `account_summary`-Update. |
-
-## Architektur
-
-Die vollständige Architektur inklusive Hexagonal-Schnitt und End-to-End-Sequenzdiagramm ist in [docs/architecture.md](docs/architecture.md) dokumentiert.
+### Systemkontext
 
 ```mermaid
 flowchart LR
-    REST["adapter-in-rest"] --> APP["application (framework-frei)"]
-    KCONS["adapter-in-messaging"] --> APP
-    APP --> DOM["domain (framework-frei)"]
-    PERS["adapter-out-persistence<br/>(JdbcClient + Flyway)"] --> APP
-    KPROD["adapter-out-messaging<br/>(Outbox Relay + Avro)"] --> APP
+    USER["Benutzer / Operator<br/>(Browser SPA)"] -->|"OIDC PKCE + REST"| SYS["ledger-stream<br/>Event-getriebenes Buchungssystem"]
+    CLI["Lastgenerator / CI-Client<br/>(OIDC Client)"] -->|"REST + Idempotency-Key"| SYS
+    SYS -->|"JWKS / OIDC"| IDP["Keycloak 26<br/>(Identity Provider)"]
+    SYS -->|"Metrics / Dashboards"| OBS["Prometheus + Grafana<br/>(Observability)"]
+    GIT["GitHub + GHCR<br/>(Cosign + CycloneDX SBOM)"] -->|"GitOps Sync + Self-Heal"| SYS
 ```
 
-Architekturentscheidungen werden als ADRs unter [`docs/adr/`](docs/adr/) gepflegt:
-- [ADR-0001: Spring `JdbcClient` statt JPA/Hibernate](docs/adr/0001-jdbcclient-statt-jpa.md)
-- [ADR-0002: Avro-Kompatibilität `FULL` statt `BACKWARD`](docs/adr/0002-avro-full-compatibility-statt-backward.md)
-- Bewusste Entwurfsgrenzen (u. a. Per-Account-Reihenfolge bei Non-Blocking Retry-Topics): [docs/design-decisions.md](docs/design-decisions.md)
+### Container-Architektur
 
-## Idempotenz-Semantik (HTTP-API)
-
-Jede schreibende Buchungsoperation (`POST /api/v1/accounts/{id}/bookings`, `POST /api/v1/accounts/{id}/bookings/{bookingId}/cancel`) erfordert den Header `Idempotency-Key` (1–128 Zeichen, eindeutig pro Konto über `UNIQUE (account_id, idempotency_key)`):
-
-1. **Atomare Persistenz & Payload-Fingerprint:** Statuscode, serialisierter JSON-Response-Body und `request_fingerprint` (`CHAR(64)`, SHA-256 über die kanonischen Geschäftsfelder `accountId`, `type`, normalisierter `amount`, `currency`, `reference` — **nicht** über den rohen JSON-Body) werden in derselben Datenbanktransaktion wie die Konto- und Buchungsänderung in `idempotency_keys` persistiert.
-2. **Byte-gleiches Replay (gleicher Fingerprint):** Ein wiederholter Request mit demselben `(account_id, idempotency_key)` **und** identischem `request_fingerprint` führt keinen zweiten Buchungseffekt aus und liefert den persistierten HTTP-Status sowie den **byte-identischen** Response-Body zurück (`Idempotency-Replayed: true`).
-3. **Key-Reuse mit abweichendem Inhalt (`422`):** Wird derselbe `(account_id, idempotency_key)` mit **anderem** Inhalt (abweichender `request_fingerprint`, z. B. anderer Betrag) wiederverwendet, lehnt die API den Request mit HTTP **`422 Unprocessable Entity`** (RFC 7807 `type: urn:ledger-stream:error:idempotency-key-reuse`, `errorCode: IDEMPOTENCY_KEY_REUSE`) ab — keine zweite Buchung, Saldo unverändert.
-4. **Nur `2xx` wird gecacht:** Ablehnungen (`400`, `404`, `422`) rollen die Transaktion zurück und werden **nicht** in `idempotency_keys` gespeichert (`CHECK (response_status BETWEEN 200 AND 299)`).
-5. **Abgrenzung `409` / `503` vs. `422`:**
-   - **Paralleler gleicher Request (gleicher Key & gleicher Inhalt):** Verlierer liest die Antwort des Gewinners und liefert sie byte-gleich zurück. Bei konkurrierendem Konflikt ohne abgelegte Idempotenz-Antwort (Optimistic Locking) entsteht **`409 Conflict`**; überschreitet das Warten auf den Zeilen-/Index-Lock `lock_timeout = 3s` (`SQLSTATE 55P03`), liefert die API **`503 Service Unavailable`** mit `Retry-After: 1` (`LOCK_TIMEOUT`).
-   - **Gleicher Key mit anderem Inhalt:** deterministisch **`422 Unprocessable Entity`** (`urn:ledger-stream:error:idempotency-key-reuse`).
-
-## Outbox-Betrieb, Metriken & PostgreSQL-Parameter
-
-### Outbox-Alarmierung (Prometheus-Beispiel)
-
-Ein reiner Zähler wie `outbox_unsent` reicht nicht aus, um ein stehendes Relay von normalem Last-Backlog zu unterscheiden. Entscheidend ist das Alter des ältesten `PENDING`-Events (`outbox_oldest_pending_age_seconds`):
-
-```yaml
-- alert: OutboxRelayStalled
-  expr: outbox_oldest_pending_age_seconds > 300
-  for: 1m
-  labels:
-    severity: critical
-  annotations:
-    summary: "Outbox-Relay hängt oder ist ausgefallen"
-    description: "Ältestes PENDING-Outbox-Event wartet seit > 300s (Wert: {{ $value }}s)."
+```mermaid
+flowchart TB
+    FE["frontend<br/>Vue 3 + nginx-unprivileged :3000"] -->|"REST + Bearer JWT"| APP["app<br/>Spring Boot 3.5 / Java 21 :8080"]
+    FE -->|"OIDC PKCE S256"| KC["keycloak<br/>Keycloak 26 optimized :8180"]
+    APP -->|"JWKS Verify"| KC
+    APP -->|"JdbcClient Write + Outbox + Read Model"| PG[("postgres<br/>PostgreSQL 16 :5432")]
+    KC -->|"Realm DB keycloak"| PG
+    APP -->|"Avro Producer + Non-Blocking Retry Consumer"| KF["kafka<br/>Apache Kafka 3.9.1 KRaft :9092"]
+    APP -->|"Schema FULL Verify"| SR["schema-registry<br/>Confluent 7.9.9 :8081"]
+    SR -->|"Internal _schemas"| KF
+    PROM["prometheus<br/>Prometheus 3.2 :9090"] -->|"Scrape /actuator/prometheus & /metrics"| APP
+    PROM -->|"Scrape :9000/metrics"| KC
+    GRAF["grafana<br/>Grafana 11.5 :3001"] -->|"PromQL"| PROM
 ```
 
-Weitere Outbox-Metriken: `outbox_unsent` (Micrometer: `outbox_unsent_total`), `outbox_events_failed_total` (Events im Status `FAILED` nach `N=10` fehlgeschlagenen Versuchen mit exponentiellem Backoff `1s..60s` ±20 % Jitter).
+### Architekturentscheidungen & Dokumentation
 
-### Verifizierte PostgreSQL-Parameter (Docker Compose)
-
-Nach Start von `postgres` per `SHOW` bestätigt:
-
-```text
-shared_buffers       = 64MB
-work_mem             = 4MB
-maintenance_work_mem = 32MB
-lock_timeout         = 3s
-```
-
-## Fehlerbehandlung, Non-Blocking Retry & DLQ
-
-### Warum Retry-Topics (`@RetryableTopic`) statt `DefaultErrorHandler`-Backoff oder Pause/Resume?
-
-- Ein blockierender `DefaultErrorHandler` mit `ExponentialBackOff` schläft direkt im Consumer-Thread und **blockiert alle nachfolgenden Events derselben Partition** — zudem droht bei längeren Backoffs ein Überschreiten von `max.poll.interval.ms` (`300000 ms` = 5 min) und damit ungewollte Consumer-Group-Rebalances.
-- Ein manuelles `pause()`/`resume()` auf Partitionsebene stoppt ebenfalls die gesamte Partition (Head-of-Line-Blocking) und verkompliziert Offset-Management sowie Rebalance-Handling erheblich.
-- **Retry-Topics (`ledger.events-retry-0..3` → `ledger.events.dlq`)** verschieben fehlerhafte technische Nachrichten sofort asynchron aus dem Haupt-Topic und committen dessen Offset, sodass nachfolgende Nachrichten derselben Partition verzögerungsfrei weiterlaufen und `max.poll.interval.ms` nie gefährdet wird.
-
-### Fehlerklassifikation & Metriken
-
-- **Deserialisierungsfehler & fachliche Fehler** (`unknown_account`, `amount <= 0`, ungültiger Typ): **0 Retries**, direkt in `ledger.events.dlq` und `dlq_entries` unter Beibehaltung der unveränderten Rohbytes (`RawPayloadPreservingAvroDeserializer`, Base64 in Header `x-original-payload`).
-- **Technische Fehler** (DB-Ausfall, Timeout, Schreibfehler): nicht-blockierend bis zu **5 Versuche** mit exponentiellem Backoff und Jitter (`random = true`), danach `ledger.events.dlq` + `dlq_entries`.
-- **Metriken (`/actuator/prometheus`):**
-  - `dlq_entries_unhandled` (Gauge): offene DLQ-Einträge (`replayed_at IS NULL`) — Zielwert `0`, maßgeblich für Alarmierung.
-  - `dlq_replayed_total` (Counter): über `POST /admin/dlq/{id}/replay` erneut eingestellte Einträge.
-  - `consumer_retries_total` (Counter): ausgelöste nicht-blockierende Retry-Versuche (Frühindikator vor DLQ-Wachstum).
-- **Admin-Endpunkte abgesichert (Phase 7):** `GET /admin/dlq` und `POST /admin/dlq/{id}/replay` erfordern `ledger.admin.enabled=true` **und** ein gültiges OIDC-Token mit Rolle `operator` (`ROLE_operator`). Standardmäßig (`ledger.admin.enabled=false`, auch im k3s-Overlay [deploy/kustomize/overlays/prod/kustomization.yaml](deploy/kustomize/overlays/prod/kustomization.yaml) explizit gepinnt) liefern sie `404` vor `401`.
-- **Zwei unabhängige Replay-Garantien & unveränderliche Replay-Historie:** Ein erneuter Replay eines bereits wieder eingespielten DLQ-Eintrags wird an der Admin-API über den `replayed_at`-Guard mit HTTP **`409 Conflict`** abgewiesen; selbst bei einem manuellen Re-Publish am Admin-Endpunkt vorbei verhindert `UNIQUE (event_id)` auf `processed_events` eine doppelte Buchungswirkung. Jeder Replay-Versuch wird unveränderlich in `dlq_replay_attempts` protokolliert; scheitert ein Replay erneut oder trifft derselbe unlesbare Deserialisierungs-Poison mehrfach ein, dedupliziert der Partial-Unique-Index `uq_dlq_entries_unhandled_dedup_key` auf `COALESCE(event_id::text, payload_sha256) WHERE replayed_at IS NULL` in eine einzige offene Zeile und erhöht `attempt_count`.
-- Vollständiges Runbook (Analyse, Replay-Kriterien, Begründung Outbox `10` vs. Consumer `5` Retries): [docs/operations.md](docs/operations.md).
-
-## Security (Keycloak 26 + OIDC Resource Server)
-
-### Rollenmodell (Least Privilege)
-
-| Rolle | Authority | Erlaubte Endpunkte | Bewusst verweigert (`403`) |
-|---|---|---|---|
-| `viewer` | `ROLE_viewer` | `GET /api/v1/accounts/**` | `POST /api/v1/accounts/**`, `/admin/dlq/**` |
-| `writer` | `ROLE_writer` | `GET` & `POST /api/v1/accounts/**` (Kontoanlage, Buchung, Storno) | `/admin/dlq/**` |
-| `operator` | `ROLE_operator` | `GET` & `POST /api/v1/accounts/**` sowie `/admin/dlq/**` (bei `ledger.admin.enabled=true`) | — |
-
-**Entscheidung:** Drei Rollen statt zwei — Buchungs-Clients (`writer`) können geschäftliche Buchungen ausführen, dürfen aber niemals DLQ-Payloads inspizieren oder Replays auslösen (`Separation of Duties`).
-
-### Durchsetzung & Härtung
-
-- **404-vor-401-Invariante:** Ist `ledger.admin.enabled=false` (Default), schneidet eine `@Order(1)`-`SecurityFilterChain` **jede** Route unter `/admin/**` noch vor der OIDC-Prüfung ab und liefert RFC-7807 **`404 Not Found`** (unauthentifiziert, als `viewer` und als `operator`) — selbst dann, wenn unter `/admin/**` ein Controller ohne `@ConditionalOnProperty` registriert wäre (abgesichert über `AdminPathInvariantDisabledIT`/`AdminPathInvariantEnabledIT` mit Testprofil-Route `/admin/test-only`).
-- **Explizite Token-Prüfung & Allowlist-Rollen-Mapper:** `JwtAuthenticationConverter` mappt ausschließlich die Allowlist `{viewer, writer, operator}` aus `realm_access.roles` auf `ROLE_*` und verwirft technische Keycloak-Rollen (`default-roles-*`, `offline_access`, `uma_authorization`). Der `NimbusJwtDecoder` prüft Signatur über JWKS (kein `alg=none`, kein fremder Key), `exp`/`nbf`, `iss` sowie explizit `aud = ledger-stream-api`. `401` und `403` liefern strukturierte RFC-7807-Antworten (`application/problem+json`).
-- **CORS:** Explizite Origin-Allowlist (`ledger.security.cors-allowed-origins`, kein `*` bei `allowCredentials=true`), `Allow-Headers` inkl. `Authorization` und `Idempotency-Key`, `Access-Control-Expose-Headers` inkl. `Idempotency-Replayed`, `X-Correlation-Id` und `Retry-After` (verifiziert in `SecurityNegativeJwtIT`), Preflight für `POST` verifiziert.
-- **Keine Secrets im Repository & Testinfrastruktur-Markierung:** [keycloak/realm-export.json](keycloak/realm-export.json) enthält den Public-PKCE-Client `ledger-stream-spa` (`S256`, ohne Secret) sowie den vertraulichen Client `ledger-stream-cli` mit Platzhalter `${LEDGER_CLI_CLIENT_SECRET}` (Injektion per Env / Kubernetes `secretKeyRef` in [deploy/kustomize/base/keycloak-deployment.yaml](deploy/kustomize/base/keycloak-deployment.yaml)). `ledger-stream-cli` mit `directAccessGrantsEnabled=true` dient ausschließlich als Test- und CI-Infrastruktur; produktive Benutzer-Logins erfolgen ausschließlich über `ledger-stream-spa` (Authorization Code + PKCE `S256`).
-
-## Frontend (Vue 3 + TypeScript + Vite + `oidc-client-ts`)
-
-- **Idempotency-Key-Lebenszyklus (`frontend/src/composables/useBookingForm.ts`):** Der `Idempotency-Key` entsteht per `crypto.randomUUID()` beim **Öffnen** des Buchungsformulars, ist im Formular sichtbar und kopierbar und wird **niemals** im Submit-Handler erzeugt. Erst nach bestätigter `2xx`-Antwort wird ein neuer Key gezogen; „Erneut senden (gleicher Key)“ sowie parallele Doppelklicks behalten exakt denselben Key.
-- **Kein deaktivierter Submit-Button:** Während laufender Requests zeigt der Submit-Button einen Spinner (`aria-busy="true"`) statt `disabled`, ergänzt um **„Absichtlich doppelt senden (2× parallel)“** mit Live-Doppelklick-Protokoll (2 Requests, 1 Buchung, byte-gleicher Response-Body).
-- **Geld als String (`frontend/src/utils/money.ts`):** `BigDecimal`-Werte werden vom Backend als JSON-Strings (`@JsonFormat(shape = STRING)`) geliefert und direkt per `Intl.NumberFormat('de-DE', { style: 'currency', currency })` formatiert — ohne `number`-Parsing und ohne Arithmetik.
-- **Token-Lifecycle & Sichtbarkeit:** `automaticSilentRenew`, explizite Re-Login-Ansicht bei abgelaufenem Token (kein leerer Bildschirm), Logout über `end_session_endpoint`, fünf sichtbare Fehlerzustände (`401`, `403`, `422` RFC-7807 Feldfehler, `409`/Idempotenz-Replay, Netzwerk mit Retry) sowie `document.visibilityState`-gesteuertes Polling mit Backoff und `clearInterval` in `onUnmounted`.
-- **Strikte Typisierung:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, ESLint `@typescript-eslint/no-explicit-any: error` und `consistent-type-assertions: never` (0 `any`, 0 `as unknown as X`).
-
-## Observability (Micrometer, Prometheus, Grafana, JSON-Logging & Correlation-ID)
-
-- **Micrometer-Metriken (`/actuator/prometheus`, strikt begrenzte Kardinalität):** Ausschließlich geschlossene Label-Mengen (`outcome`, `reason`, `type`, `result`) — **niemals** `accountId`, `eventId`, `correlationId` oder Beträge als Metrik-Tag. Exponiert u. a. `outbox_unsent`, `outbox_oldest_pending_age_seconds`, `outbox_events_failed_total`, `outbox_events_relayed_total{type,result}`, `consumer_processed_total{outcome}`, `consumer_duplicates_rejected_total{reason="duplicate"}`, `consumer_poison_total` (getrennter Poison-Zähler statt Vermischung mit Duplikaten), `consumer_retries_total`, `dlq_entries_unhandled`, `dlq_replayed_total`, `http_server_requests_seconds` (inkl. Histogram-Buckets).
-- **Prometheus & Grafana (Zero-Click-Provisioning):** [observability/prometheus.yml](observability/prometheus.yml) scrapt `app:8080/actuator/prometheus` und `keycloak:9000/metrics` mit `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression`. [observability/grafana/provisioning/datasources/prometheus.yml](observability/grafana/provisioning/datasources/prometheus.yml) provisioniert die Datasource mit fester `uid: prometheus`; [observability/grafana/dashboards/ledger-stream.json](observability/grafana/dashboards/ledger-stream.json) (`uid: ledger-stream-overview`, 8 Panels inkl. roter 300s-Schwelle auf `outbox_oldest_pending_age_seconds` sowie separater HTTP-**p95**- und **p99**-Panels mit `uri!~"/actuator.*"` und `sum by (le, uri)`) referenziert diese UID ohne `__inputs`.
-- **Strukturiertes JSON-Logging & 3-stufige Correlation-ID:** [logback-spring.xml](app/src/main/resources/logback-spring.xml) (`logstash-logback-encoder`) schreibt flaches JSON (`ts`, `level`, `logger`, `message`, `correlationId`, `eventId` nur im Event-Kontext; keine Tokens, `Authorization`-Header oder Roh-Payloads). `CorrelationIdFilter` validiert eingehende `X-Correlation-Id` strikt gegen `^[A-Za-z0-9._-]{8,64}$` (ungültige Werte werden verworfen, mit neuer UUID ersetzt und `correlationIdRejected=true` geloggt), persistiert sie in `outbox_events.correlation_id`, überträgt sie per Kafka-Header in den Consumer (`MDC` + `finally MDC.clear()`) und erhält sie beim DLQ-Replay.
-
-## Ressourcenbudget (`/sys/fs/cgroup/memory.stat` `anon` vs. `file` — ALLE 8 Container)
-
-Keycloak 26 läuft mit `start --optimized --import-realm`, `-Xmx256m`, `KC_CACHE=local` auf der **bestehenden** PostgreSQL-16-Instanz (eigene Datenbank `keycloak`, kein H2, kein Dev-Mode). Weil `docker stats` den reclaimbaren Linux-Page-Cache (`file`) einrechnet, wurde im 100.000-Buchungen-Peak zusätzlich `/sys/fs/cgroup/memory.stat` (`anon` = nicht-reclaimbarer Working-Set vs. `file` = reclaimbarer Page-Cache) je Container erhoben (M2):
-
-| Container | Compose-Limit (k3s-Limit) | Tuning | Peak inkl. Cache (`memory.current`) | davon `anon` (Working-Set) | davon `file` (reclaimbar) |
-|---|---|---|---:|---:|---:|
-| `ledger-stream-postgres` | `320 MiB` (`320Mi`) | `shared_buffers=64MB`, `work_mem=4MB`, `max_connections=60`, `lock_timeout=3s` | `319,74 MiB` | `65,64 MiB` | `232,70 MiB` |
-| `ledger-stream-kafka` | `448 MiB` (`448Mi`) | KRaft, 6 Partitionen, `-Xms128m -Xmx192m`, `dedupe_buffer=16MB` | `301,58 MiB` | `228,81 MiB` | `64,14 MiB` |
-| `ledger-stream-schema-registry` | `384 MiB` (`384Mi`) | `FULL`, `-Xmx192m -XX:MaxMetaspaceSize=96m` | `216,25 MiB` | `211,77 MiB` | `0,06 MiB` |
-| `ledger-stream-keycloak` | `640 MiB` (`640Mi`) | `start --optimized`, `KC_DB=postgres`, `KC_CACHE=local`, `-Xms128m -Xmx256m` | `412,65 MiB` | `408,21 MiB` | `0,08 MiB` |
-| `ledger-stream-app` | `512 MiB` Demo (`640Mi` k3s) | Java 21 JRE, `-XX:MaxRAMPercentage=60.0` (k3s: `55.0`), Consumer Conc. `6` | `507,27 MiB` | `498,38 MiB` | `0,05 MiB` |
-| `ledger-stream-frontend` | `48 MiB` (`48Mi`) | `nginxinc/nginx-unprivileged:1.27-alpine` (statisches Vue-Bundle) | `19,91 MiB` | `15,82 MiB` | `0,21 MiB` |
-| `ledger-stream-prometheus` | `192 MiB` (`192Mi`) | `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression` | `22,81 MiB` | `20,54 MiB` | `0,16 MiB` |
-| `ledger-stream-grafana` | `192 MiB` (`192Mi`) | `GF_INSTALL_PLUGINS=""`, `GF_ANALYTICS_CHECK_FOR_UPDATES=false` | `108,49 MiB` | `66,70 MiB` | `36,11 MiB` |
-| **Summe (alle 8 Container, 100k Peak)** | **k3s `ResourceQuota` `requests`: `1536Mi`** | **k3s Summe `limits.memory`: `2864Mi` (`1,86×` Burst-Overcommit)** | **`1908,70 MiB`** | **`1515,87 MiB`** *(Puffer `+20,13 MiB` zu `1536 MiB`)* | **`333,51 MiB`** |
-
-> **Befunde aus M2 & M3 (`jcmd 1 VM.native_memory summary` im 100k-Peak):**
-> - **1,5-GiB-Nachweis (M2):** Im Unconstrained-100k-Peak beträgt der gesamte nicht-reclaimbare `anon`-Anteil aller 8 Container **`1515,87 MiB`** — das System bleibt innerhalb von `1536 MiB` mit knapp **`20,13 MiB` Luft** (`333,51 MiB` entfallen auf reclaimbaren Page-Cache bei Postgres `232,70 MiB`, Kafka `64,14 MiB` und Grafana `36,11 MiB`). Unter harter 1,5-vCPU-Drosselung (`keycloak: 0.10 vCPU`) steigt die `anon`-Summe temporär auf `1662,00 MiB` (`-126,00 MiB`), weil Keycloak unter 0,10-vCPU-Starvation während wiederholter Token-Refreshes auf `508,87 MiB` `anon` anwächst (App bleibt bei `465,14 MiB`).
-> - **App-Non-Heap-Diagnose (M3):** `jcmd 1 VM.native_memory summary` im 100k-Peak (`committed=522059 KB` ≈ `509,8 MiB`) belegt, dass Direct Buffers (`Other`) mit **`12,8 MiB` unauffällig** sind (kein Direct-Buffer-Leak). Der reale Non-Heap (~220–255 MiB) setzt sich aus **Metaspace + Class + Shared Class (`98,2 MiB`, 17.952 Klassen)**, **G1GC-Strukturen (`51,5 MiB`)**, **JIT CodeCache (`45,3 MiB`)**, **Symbol-Tabelle (`25,9 MiB`)**, **178 Threads (`18,3 MiB` u. a. Tomcat + 36 `@RetryableTopic`-Consumer-Threads)** sowie **C2-Compiler-Arena-Spitzen (`~55 MiB`)** zusammen. Deshalb ist **`512 MiB` das knappe Demo-Limit** (Docker Compose) und **`640 MiB` die gemessene k3s-Produktionsgrenze** (`281 MiB` Heap-Peak + `~240 MiB` Non-Heap + `~120 MiB` Reserve).
-> - **Warum `limits.memory`-Summe `2864 MiB` (`1,86×`) > `ResourceQuota` `requests.memory` (`1536 MiB`):** Kubernetes erzwingt das 1,5-GiB-Budget hart über `ResourceQuota` auf **`requests.memory: 1536Mi`** (`1424Mi` belegt, orientiert an `anon`). Die höheren Einzellimits (`2864Mi` Summe) erlauben reclaimbaren Page-Cache (Postgres/Kafka) und nicht-gleichzeitige JVM-Bursts ohne vorzeitige OOMKills.
-
-## Schema-Evolution (Avro + Confluent Schema Registry)
-
-- **Kompatibilitätsstufe:** `FULL` (beidseitig: v2-Consumer liest v1-Daten **und** v1-Consumer liest v2-Daten; Begründung gegenüber `BACKWARD` und `FULL_TRANSITIVE` in [ADR-0002](docs/adr/0002-avro-full-compatibility-statt-backward.md)).
-- **Evolution v1 → v2 (`LedgerBookingEvent.avsc`):** Neues optionales Feld `initiationChannel` (`"type": "string", "default": "API"`). Beim Lesen älterer v1-Nachrichten löst der Consumer den nicht-null Default `"API"` auf; `schemaVersion = 2` im Payload korrespondiert mit der v2-Schema-ID im 5-Byte Confluent-Wire-Header.
-- **CI-Erzwingung:** `SchemaEvolutionIT` prüft im CI-Build gegen eine echte Schema Registry (`confluentinc/cp-schema-registry:7.9.9`) die `FULL`-Konfiguration, beide Leserichtungen, die Ablehnung eines inkompatiblen Schemas (Pflichtfeld ohne Default → HTTP `409`) sowie byte-gleiche Rohbytes bei DLQ-Replay von v2-Events. Der CI-Workflow bricht ab, falls `SchemaEvolutionIT` nicht mit 0 Skips läuft.
+- **Architecture Decision Records ([`docs/adr/`](docs/adr/)):**
+  - [ADR-0001: Transactional Outbox statt 2PC/XA](docs/adr/0001-transactional-outbox-statt-2pc-xa.md)
+  - [ADR-0002: At-least-once + Consumer-Idempotenz statt Kafka-Transaktionen](docs/adr/0002-at-least-once-idempotenz-statt-kafka-transaktionen.md)
+  - [ADR-0003: Spring `JdbcClient` statt JPA/Hibernate](docs/adr/0003-jdbcclient-statt-jpa.md)
+  - [ADR-0004: Apache Kafka KRaft Single-Broker statt Multi-Broker/ZooKeeper](docs/adr/0004-kraft-single-broker.md)
+  - [ADR-0005: Avro-Kompatibilität `FULL` statt `BACKWARD`](docs/adr/0005-avro-full-compatibility-statt-backward.md)
+  - [ADR-0006: Non-Blocking Retry-Topics (`@RetryableTopic`) statt Pause/Resume oder blockierendem Backoff](docs/adr/0006-retry-topics-statt-pause-resume.md)
+  - [ADR-0007: Keycloak 26 statt Spring Authorization Server](docs/adr/0007-keycloak-statt-spring-authorization-server.md)
+  - [ADR-0008: Kustomize statt Helm](docs/adr/0008-kustomize-statt-helm.md)
+  - [ADR-0009: Ressourcenbudget als Designzwang](docs/adr/0009-ressourcenbudget-als-designzwang.md)
+  - [ADR-0010: Effektive Exactly-once-Terminologie](docs/adr/0010-effektive-exactly-once-terminologie.md)
+- **Bewusste Trade-offs & Systemgrenzen:** [docs/design-decisions.md](docs/design-decisions.md)
+- **Betriebs-Runbook (Outbox, DLQ, Rollback, Broker-Ausfall, Skalierung):** [docs/operations.md](docs/operations.md)
+- **Detail-Architektur (Hexagonal & End-to-End-Sequenz):** [docs/architecture.md](docs/architecture.md)
 
 ## Schnellstart
 
 ```bash
-# 1. Lokale Infrastruktur starten (PostgreSQL 16, Kafka 3.9.1 KRaft, Schema Registry)
+# 1. Kompletten lokalen Stack starten (PostgreSQL 16, Kafka 3.9.1 KRaft, Schema Registry,
+#    Keycloak 26, App, Frontend, Prometheus, Grafana)
 docker compose up -d --wait
 
-# 2. Build, ArchUnit-Prüfung und Testcontainers-Integrationstests ausführen
+# 2. Backend bauen, ArchUnit-Regeln und Testcontainers-Integrationstests ausführen
 ./mvnw verify
+
+# 3. Frontend-Tests, TypeScript-Check und ESLint ausführen
+npm --prefix frontend ci && npm --prefix frontend run typecheck && npm --prefix frontend run lint && npm --prefix frontend test
 ```
 
-> Hinweis: PostgreSQL in `docker-compose.yml` ist standardmäßig nur innerhalb des Compose-Netzwerks erreichbar (kein Host-Port-Mapping). Alle Integrationstests laufen vollständig isoliert über Testcontainers.
+### Lokale Endpunkte & Zugang (`docker-compose.yml`)
 
-## Lastnachweis (Phase 10 — 100.000 Buchungen, reproduzierbar)
+| Dienst | URL | Zweck / Zugang |
+|---|---|---|
+| **Frontend (SPA)** | `http://localhost:3000` | Vue-3-UI mit OIDC PKCE (`S256`) gegen Realm `ledger-stream` |
+| **Backend API & Actuator** | `http://localhost:8080` | REST API (`/api/v1/accounts/**`), Health (`/actuator/health`), Metriken (`/actuator/prometheus`) |
+| **Keycloak 26** | `http://localhost:8180` | Realm `ledger-stream` (Demo-User aus `keycloak/realm-export.json`: `viewer`/`viewer`, `writer`/`writer`, `operator`/`operator`) |
+| **Prometheus** | `http://localhost:9090` | Metrik-Abfragen (Scrape-Targets: `app:8080`, `keycloak:9000`) |
+| **Grafana** | `http://localhost:3001` | Zero-Click-Dashboard `ledger-stream-overview` (`admin` / Env `GRAFANA_ADMIN_PASSWORD`, lokal Default `admin`) |
+
+> **Hinweise:** PostgreSQL (`5432`) ist in `docker-compose.yml` bewusst nicht auf den Host gemappt. Alle Integrationstests laufen vollständig isoliert gegen Testcontainers. Der vertrauliche Keycloak-Client `ledger-stream-cli` (`directAccessGrantsEnabled=true`) in [keycloak/realm-export.json](keycloak/realm-export.json) dient ausschließlich als Test- und Lastgenerator-Infrastruktur; produktive Browser-Logins nutzen ausschließlich den Public-PKCE-Client `ledger-stream-spa`.
+
+## Effektive Exactly-once-Semantik
+
+In einem verteilten System aus PostgreSQL und Kafka existiert kein „Exactly-once-Delivery“ über die Netzwerkgrenze. `ledger-stream` trennt deshalb explizit drei Schichten (Begründung in [ADR-0010](docs/adr/0010-effektive-exactly-once-terminologie.md)):
+
+> Kafka liefert at-least-once, der Consumer dedupliziert über `event_id` in derselben Transaktion wie das Saldo-Update. Die Wirkung tritt genau einmal ein — nachweisbar im Lasttest: Summe der Buchungen = akzeptierte Anfragen, bei 5 % Duplikaten.
+
+| Schicht | Garantie | Mechanismus in `ledger-stream` | Nachweis |
+|---|---|---|---|
+| **Zustellung (Delivery)** | **At-least-once** | Transactional Outbox (`FOR UPDATE SKIP LOCKED`, Batch `500`, `200 ms` Intervall) publiziert nach Commit; Crash zwischen Broker-Ack und `markSent` führt zu erneutem Publish. | [`TransactionalOutboxIT`](app/src/test/java/io/ledgerstream/app/TransactionalOutboxIT.java), [`OutboxRelayServiceTest`](application/src/test/java/io/ledgerstream/application/service/OutboxRelayServiceTest.java) |
+| **Verarbeitung (Processing)** | **At-least-once** | Manuelles Offset-Commit erst nach DB-Commit; Crash zwischen DB-Commit und Offset-Commit sowie Non-Blocking Retry-Topics liefern Records erneut aus. | [`IdempotentConsumerIT`](app/src/test/java/io/ledgerstream/app/IdempotentConsumerIT.java), [`DlqAndRetryIT`](app/src/test/java/io/ledgerstream/app/DlqAndRetryIT.java) |
+| **Wirkung (Effect)** | **Genau einmal (Exactly-once)** | Schreibseite: `UNIQUE (account_id, idempotency_key)` + SHA-256-Payload-Fingerprint + byte-gleiches Replay gecachter `2xx`-Antworten. Leseseite: `INSERT INTO processed_events ... ON CONFLICT DO NOTHING` in derselben Transaktion wie das `account_summary`-Update. | [`AccountBookingApiIT`](app/src/test/java/io/ledgerstream/app/AccountBookingApiIT.java), [`IdempotentConsumerIT`](app/src/test/java/io/ledgerstream/app/IdempotentConsumerIT.java), [`InvariantChecker`](load-generator/src/main/java/io/ledgerstream/loadgen/InvariantChecker.java) |
+
+## Idempotenz-Semantik, Fehlerbehandlung & Security
+
+### HTTP-Idempotenz (`Idempotency-Key` + Payload-Fingerprint)
+
+Jede schreibende Operation (`POST /api/v1/accounts/{id}/bookings`, `POST /api/v1/accounts/{id}/bookings/{bookingId}/cancel`) erfordert `Idempotency-Key` (`1–128` Zeichen, `UNIQUE (account_id, idempotency_key)`):
+
+- **Gleicher Key + gleicher Inhalt:** Atomar persistierte `2xx`-Antwort wird byte-identisch mit Header `Idempotency-Replayed: true` zurückgeliefert; keine zweite Buchung, kein zweites Kafka-Event ([`AccountBookingApiIT`](app/src/test/java/io/ledgerstream/app/AccountBookingApiIT.java)).
+- **Gleicher Key + anderer Inhalt (`request_fingerprint` ≠ SHA-256 der kanonischen Felder `accountId`, `type`, normalisierter `amount`, `currency`, `reference`):** HTTP **`422 Unprocessable Entity`** (RFC 7807 `urn:ledger-stream:error:idempotency-key-reuse`), keine zweite Buchung, Saldo unverändert ([`AccountBookingApiIT`](app/src/test/java/io/ledgerstream/app/AccountBookingApiIT.java)).
+- **Abgrenzung `409` / `503` vs. `422`:** Paralleler Konflikt beim Optimistic Locking liefert `409 Conflict`; überschreitet ein Lock-Wait `lock_timeout = 3s` (`SQLSTATE 55P03`), liefert die API `503 Service Unavailable` + `Retry-After: 1` (`4xx`/`5xx` werden per `CHECK (response_status BETWEEN 200 AND 299)` niemals gecacht).
+
+### Non-Blocking Retry, DLQ & Schema-Evolution
+
+- **Fehlerklassifikation:** Deserialisierungsfehler und fachliche Fehler (`unknown_account`, `amount <= 0`, ungültiger Typ) erhalten **0 Retries** und landen direkt in `ledger.events.dlq` + `dlq_entries` unter Beibehaltung der unveränderten Rohbytes (`RawPayloadPreservingAvroDeserializer`, Base64 in `x-original-payload`, verifiziert in [`RawPayloadPreservingAvroDeserializerTest`](adapter-in-messaging/src/test/java/io/ledgerstream/adapter/in/messaging/RawPayloadPreservingAvroDeserializerTest.java) und [`DlqAndRetryIT`](app/src/test/java/io/ledgerstream/app/DlqAndRetryIT.java)). Technische Fehler durchlaufen bis zu **5 nicht-blockierende Versuche** über Retry-Topics (`ledger.events-retry-0..3`) mit exponentiellem Backoff + Jitter ([`DlqAndRetryIT`](app/src/test/java/io/ledgerstream/app/DlqAndRetryIT.java), [ADR-0006](docs/adr/0006-retry-topics-statt-pause-resume.md)).
+- **Retry-Topic-Thread-Trade-off (F4):** `6` Partitionen × `6` Topics (Haupt-Topic + `4` Retry-Topics + DLQ) erzeugen **`36` Consumer-Threads**. Laut `jcmd VM.native_memory summary` im 100k-Peak macht deren Thread-Stack nur ca. **`3,7 MiB`** aus (von `18,3 MiB` über alle `178` JVM-Threads); es handelt sich primär um einen **CPU-/Context-Switch-Trade-off**, nicht um ein RAM-Problem. Eine Reduktion auf `2` Retry-Stufen (`18` Threads, über `KAFKA_RETRY_MAX_ATTEMPTS`) spart Context-Switches bei leicht gröberer Backoff-Staffelung (Details in [ADR-0006](docs/adr/0006-retry-topics-statt-pause-resume.md) und [docs/design-decisions.md](docs/design-decisions.md)).
+- **DLQ-Wiedereintritt & unveränderliche Replay-Historie:** Jeder Replay-Versuch wird unveränderlich in `dlq_replay_attempts` protokolliert; erneute Fehlschläge oder wiederholte unlesbare Poisons dedupliziert der Partial-Unique-Index `uq_dlq_entries_unhandled_dedup_key` auf `COALESCE(event_id::text, payload_sha256) WHERE replayed_at IS NULL` (erhöht `attempt_count` statt eine zweite offene Zeile anzulegen, verifiziert in [`DlqAndRetryIT`](app/src/test/java/io/ledgerstream/app/DlqAndRetryIT.java)).
+- **Schema-Evolution (`FULL`):** `LedgerBookingEvent.avsc` v1 → v2 ergänzt `initiationChannel` mit Default `"API"`. Kompatibilitätsstufe `FULL` (beidseitig v1↔v2) ist in der Registry konfiguriert und im CI gegen `confluentinc/cp-schema-registry:7.9.9` getestet ([`SchemaEvolutionIT`](app/src/test/java/io/ledgerstream/app/SchemaEvolutionIT.java), [ADR-0005](docs/adr/0005-avro-full-compatibility-statt-backward.md)).
+
+### Security, Frontend & Observability
+
+- **OIDC-RBAC (Least Privilege):** Drei Allowlist-Rollen (`viewer` → `GET /api/v1/**`, `writer` → `GET`/`POST /api/v1/**`, `operator` → zusätzlich `/admin/dlq/**` bei `ledger.admin.enabled=true`); technische Keycloak-Rollen (`default-roles-*`, `offline_access`, `uma_authorization`) werden verworfen ([`KeycloakSecurityIT`](app/src/test/java/io/ledgerstream/app/KeycloakSecurityIT.java), [`SecurityNegativeJwtIT`](app/src/test/java/io/ledgerstream/app/SecurityNegativeJwtIT.java)). Ist `ledger.admin.enabled=false` (Default und in [`overlays/prod`](deploy/kustomize/overlays/prod/kustomization.yaml) gepinnt), liefert jede Route unter `/admin/**` **`404` vor `401`** ([`AdminPathInvariantDisabledIT`](app/src/test/java/io/ledgerstream/app/AdminPathInvariantDisabledIT.java), [`AdminPathInvariantEnabledIT`](app/src/test/java/io/ledgerstream/app/AdminPathInvariantEnabledIT.java)). JWT-Signatur, `exp`/`nbf`, `iss`, `aud = ledger-stream-api` und CORS-Allowlist sind negativ getestet ([`SecurityNegativeJwtIT`](app/src/test/java/io/ledgerstream/app/SecurityNegativeJwtIT.java)).
+- **Frontend (Vue 3 + TypeScript strict):** `Idempotency-Key` entsteht beim Formular-Öffnen (`useBookingForm.ts`), Submit-Button bleibt klickbar mit Spinner + „Absichtlich doppelt senden (2× parallel)“, Geldbeträge laufen durchgängig als String (`money.ts`, 0 `any`, 0 `as unknown as X`, verifiziert via `Vitest` in `frontend/src/**/*.spec.ts`).
+- **Observability:** Geschlossene Micrometer-Kardinalität auf `/actuator/prometheus` (inkl. `outbox_oldest_pending_age_seconds`, `consumer_poison_total`, `consumer_duplicates_rejected_total{reason="duplicate"}`, `dlq_entries_unhandled`, `http_server_requests_seconds`), strukturiertes JSON-Logging mit strikt validierter `X-Correlation-Id` (`^[A-Za-z0-9._-]{8,64}$`) über HTTP → Outbox → Kafka → Consumer → DLQ-Replay ([`ObservabilityAndCorrelationIT`](app/src/test/java/io/ledgerstream/app/ObservabilityAndCorrelationIT.java)), Zero-Click-Grafana-Dashboard [`observability/grafana/dashboards/ledger-stream.json`](observability/grafana/dashboards/ledger-stream.json) (`uid: ledger-stream-overview`, 8 Panels inkl. p95/p99 und 300s-Outbox-Schwelle).
+
+## Lastnachweis (100.000 Buchungen, reproduzierbar)
 
 > **Klare Trennung der Nachweise:**
-> - **Retry-Leiter (5 Versuche, exponentieller Backoff + Jitter):** nachgewiesen über dedizierten Integrationstest (`DlqAndRetryIT`, Phase 5), nicht über den Lasttest.
-> - **Duplikat-Kohorte (5 %, L2):** echte Replays bereits akzeptierter Anfragen aus einem Ringpuffer (`Idempotency-Key` + identischer Payload → `201 Created` + `Idempotency-Replayed: true`, byte-identischer Body, keine zweite Buchung, kein zweites Kafka-Event → `consumer_duplicates_rejected_total{reason="duplicate"} == 0`). Consumer-seitige Duplikat-Abweisung (`UNIQUE(event_id)`) ist separat in `IdempotentConsumerIT` nachgewiesen.
-> - **DLQ-Anteil im Lasttest (1 %):** transportseitige Fault Injection (schema-valide Avro-v2-Poison-Events — 50 % `unknown_account`, 50 % `non_positive_amount` — direkt ins Topic `ledger.events` durch `load-generator`), kein Test-Schalter im Produktivcode.
-> - **Aufwärmphase:** erste `5 s` gegen dedizierte Warmup-Konten, vollständig aus Durchsatz- und Latenzwerten ausgeschlossen (in der Gesamt-DB-Invariante jedoch exakt gegen `bookings` und `processed_events` mitgeprüft).
+> - **5 % Duplikate (L2):** Echte Replays bereits akzeptierter Anfragen aus einem Ringpuffer (`Idempotency-Key` + identischer Payload → `201 Created` + `Idempotency-Replayed: true`, byte-gleicher Body, kein zweites Kafka-Event → `consumer_duplicates_rejected_total{reason="duplicate"} == 0`). Die Consumer-seitige Idempotenz (`UNIQUE(event_id)`) ist separat in [`IdempotentConsumerIT`](app/src/test/java/io/ledgerstream/app/IdempotentConsumerIT.java) nachgewiesen.
+> - **1 % DLQ (Fault Injection):** Schema-valide Avro-v2-Poison-Events (`500` `unknown_account` + `500` `non_positive_amount`) direkt ins Topic `ledger.events` durch [`load-generator`](load-generator/src/main/java/io/ledgerstream/loadgen/LoadGeneratorMain.java) — kein Test-Schalter im Produktivcode.
+> - **Retry-Leiter (5 Versuche, Backoff + Jitter):** Nachgewiesen in [`DlqAndRetryIT`](app/src/test/java/io/ledgerstream/app/DlqAndRetryIT.java), nicht im Lasttest.
+> - **Warmup:** Erste `5 s` gegen dedizierte Warmup-Konten, aus Durchsatz und Latenz ausgeschlossen (in den DB-Gesamtinvarianten in [`InvariantChecker`](load-generator/src/main/java/io/ledgerstream/loadgen/InvariantChecker.java) jedoch exakt mitgeprüft).
 
-### Umgebung & Reproduzierbarkeits-Parameter (L6)
+### Umgebung & Reproduzierbarkeits-Parameter
 
-| Parameter | Wert |
+| Parameter | Wert (Quelle) |
 |---|---|
 | **Host-Hardware** | Intel Core Ultra 7 155H (`22` vCPU / 11 Kerne × 2 Threads), `31 GiB` RAM, `1 TB` virtuelle Disk (`/dev/sdd`), virtualisiert (`WSL2` / Microsoft Hypervisor) |
-| **Container-Konfiguration** | `docker-compose.yml` + `docker-compose.loadtest.yml` (identische `mem_limit`-Werte wie oben; CPU-Caps für den Lastlauf entdrosselt: `app: 6.0`, `postgres: 4.0`, `kafka: 2.0`, `keycloak: 2.0`, `schema-registry: 1.0`) |
-| **JVM (App-Container)** | `eclipse-temurin:21-jre-alpine`, `JAVA_OPTS="-XX:MaxRAMPercentage=60.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"` (`512 MiB` Limit → `~307 MiB` Heap) |
-| **JVM (Client `load-generator`)** | `OpenJDK 25.0.2 LTS (Corretto-25.0.2.10.1)` (kompiliert mit `--release 21`), `-Djdk.httpclient.keepalive.timeout=60` |
-| **Kafka-Partitionen & Consumer (L3a)** | `ledger.events`: **6 Partitionen**, `ledger.events.dlq`: **6 Partitionen**, Consumer-Concurrency: **`6`** (`KAFKA_CONSUMER_CONCURRENCY=6`) |
-| **Outbox-Relay-Deckel (L3b)** | Batch `500`, Poll-Intervall `200 ms` (`OUTBOX_RELAY_FIXED_DELAY_MS=200`, theoretischer Deckel `2.500 Events/s`; Wave-basiertes Kafka-Pipelining je distinktem Konto) |
-| **Client-Setup (L3c)** | `load-generator` CLI (ohne Spring-Kontext), `--threads=32`, `128` vorangelegte Benchmark-Konten, HTTP/1.1 Keep-Alive Connection-Pool |
-| **Aufruf (reproduzierbar)** | `java -Djdk.httpclient.keepalive.timeout=60 -jar load-generator/target/load-generator-0.1.0-SNAPSHOT-shaded.jar --bookings=100000 --duplicates=0.05 --poison=0.01 --seed=20261124 --threads=32 --warmup-seconds=5 --base-url=http://127.0.0.1:8085` |
+| **Container-Profile** | Unconstrained: [`docker-compose.loadtest.yml`](docker-compose.loadtest.yml) · 1,5 vCPU rebalanced (F1): [`docker-compose.loadtest-1.5vcpu.yml`](docker-compose.loadtest-1.5vcpu.yml) |
+| **App-JVM** | `eclipse-temurin:21-jre-alpine`, `JAVA_OPTS="-XX:MaxRAMPercentage=60.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"` (`512 MiB` Compose-Limit) |
+| **Client-JVM** | `OpenJDK 25.0.2 LTS (Corretto-25.0.2.10.1)` (kompiliert mit `--release 21`), `-Djdk.httpclient.keepalive.timeout=60` |
+| **Kafka & Consumer** | `ledger.events`: `6` Partitionen, `ledger.events.dlq`: `6` Partitionen, `KAFKA_CONSUMER_CONCURRENCY=6` ([`KafkaTopicProperties`](adapter-out-messaging/src/main/java/io/ledgerstream/adapter/out/messaging/KafkaTopicProperties.java)) |
+| **Outbox-Relay** | Batch `500`, Poll-Intervall `200 ms` (`OUTBOX_RELAY_FIXED_DELAY_MS=200`, theoretischer Deckel `2.500 Events/s`, Wave-Pipelining je Konto; [`OutboxRelayService`](application/src/main/java/io/ledgerstream/application/service/OutboxRelayService.java)) |
+| **Client & Aufruf** | `load-generator` CLI (ohne Spring), `--threads=32`, `128` Benchmark-Konten, `--seed=20261124`: `java -Djdk.httpclient.keepalive.timeout=60 -jar load-generator/target/load-generator-0.1.0-SNAPSHOT-shaded.jar --bookings=100000 --duplicates=0.05 --poison=0.01 --seed=20261124 --threads=32 --warmup-seconds=5 --base-url=http://127.0.0.1:8085` |
 
-### Ergebnisse (Unconstrained vs. 1,5-vCPU-Budget — jeweils 100.000 Buchungen, Seed `20261124`)
+### Ergebnisse aller drei 100k-Läufe (Seed `20261124`, jeweils [`InvariantChecker`](load-generator/src/main/java/io/ledgerstream/loadgen/InvariantChecker.java))
 
-> **Abgrenzung Consumer-Idempotenz (M4c):** Der 100k-Lauf erzeugt **keine** Consumer-Duplikate, da alle 5 % L2-Duplikate bereits synchron an der HTTP-API über `idempotency_keys` abgefangen werden (`consumer_duplicates_rejected_total{reason="duplicate"} == 0`). Die Consumer-seitige Idempotenz (`UNIQUE(event_id)` auf `processed_events`) ist durch die dedizierten Integrationstests (`IdempotentConsumerIT`, u. a. 3-fach-Zustellung & Crash zwischen DB-Commit und Offset-Commit) belegt, nicht durch den Benchmark.
+| Profil | Gesendet (Reg / Dup / Poison) | Akzeptiert (DB-Diff) | L2-Replays (Mismatch) | Consumer-Dup (`reason="duplicate"`) | DLQ / Poison (Diff) | `max(outbox_unsent)` | HTTP-Dauer (ohne 5s Warmup) | Drain (Gesamt) | Durchsatz HTTP (akzept. Buch./s) | Durchsatz Consumer (Prom) | `anon`-Peak (8 Container) | Invariante |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **Unconstrained** (`docker-compose.loadtest.yml`) | `106.000` (`100k`/`5k`/`1k`) | `100.000` (`0`) | `5.000` (`0`) | `0` | `1.000` (`0`) | `8.549` | `93,97 s` | `103,35 s` (`197,32 s`) | `1064,2 /s` (`1117,4` HTTP/s) | `659,2 /s` (`2m`) | **`1515,87 MiB`** (`-20,13` unter 1536) | **PASS** (`EXIT 0`, 10/10 Konten) |
+| **1,5 vCPU initial** (`app 0.60`, `pg 0.35`, `kf 0.25`, `sr 0.15`, `kc 0.10`, `rest 0.05`) | `106.000` (`100k`/`5k`/`1k`) | `100.000` (`0`) | `5.000` (`0`) | `0` | `1.000` (`0`) | `899` | `998,03 s` | `278,64 s` (`1276,67 s`) | `100,2 /s` (`105,2` HTTP/s) | `254,2 /s` (`5m`) | `1662,00 MiB` (`+126,00` über 1536) | **PASS** (`EXIT 0`, 10/10 Konten) |
+| **1,5 vCPU rebalanced (F1)** (`app 0.50`, `kc 0.30` `-Xmx224m`, `pg 0.35`, `kf 0.20`, `sr 0.10`, `rest 0.05`) | `106.000` (`100k`/`5k`/`1k`) | `100.000` (`0`) | `5.000` (`0`) | `0` | `1.000` (`0`) | `1.320` | `1178,78 s` | `280,56 s` (`1459,34 s`) | `84,8 /s` (`89,1` HTTP/s) | `249,8 /s` (`5m`) | **`1637,44 MiB`** (`+101,44` über 1536) | **PASS** (`EXIT 0`, 10/10 Konten) |
 
-| Profil | Gesendet (Regulär / Dup / Poison) | Akzeptiert (DB-Diff) | Abgelehnt | L2-Duplikate (`201` + Header) | Consumer-Dup (`reason="duplicate"`) | DLQ / `consumer_poison_total` (Diff) | `max(outbox_unsent)` | HTTP-Dauer (ohne 5s Warmup) | Drain-Zeit (Gesamt bis Projektion) | Durchsatz HTTP (akzept. Buch./s) | Durchsatz Consumer (Prom 2m) | Invarianten-Check | Seed |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
-| **Unconstrained** (`docker-compose.loadtest.yml`) | `106.000` (`100k`/`5k`/`1k`) | `100.000` *(Diff `0`)* | `0` | `5.000` *(0 Mismatch)* | `0` | `1.000` *(Diff `0`)* | `8.549` | `93,97 s` | `103,35 s` *(`197,32 s`)* | `1064,2 /s` *(1117,4 HTTP/s)* | `659,2 Events/s` *(6 Part., Conc. 6)* | **PASS** (`EXIT 0`, 10/10 Konten exakt) | `20261124` |
-| **1,5 vCPU Budget** (`app 0.6`, `pg 0.35`, `kafka 0.25`, `sr 0.15`, `kc 0.10`, `rest 0.05`) | `106.000` (`100k`/`5k`/`1k`) | `100.000` *(Diff `0`)* | `0` | `5.000` *(0 Mismatch)* | `0` | `1.000` *(Diff `0`)* | `899` | `998,03 s` | `278,64 s` *(`1276,67 s`)* | `100,2 /s` *(105,2 HTTP/s)* | `254,2 Events/s` *(Prom 5m, 6 Part.)* | **PASS** (`EXIT 0`, 10/10 Konten exakt) | `20261124` |
-
-### Latenzvergleich: Clientseitig (`load-generator`) vs. Serverseitig (Prometheus `http_server_requests_seconds`)
+### Latenzvergleich: Client (`load-generator`) vs. Server (Prometheus `http_server_requests_seconds`)
 
 | Profil | Messpunkt | p50 | p95 | p99 |
 |---|---|---:|---:|---:|
-| **Unconstrained** | **Client** (`load-generator`, regulär / alle HTTP) | `22,94 ms` / `22,44 ms` | `60,85 ms` / `60,39 ms` | `92,27 ms` / `91,27 ms` |
-| **Unconstrained** | **Server** (Prometheus `POST /api/v1/accounts/{accountId}/bookings`, `5m`-Fenster) | `16,47 ms` | `49,91 ms` | `79,19 ms` |
-| **1,5 vCPU Budget** | **Client** (`load-generator`, regulär / alle HTTP) | `276,29 ms` / `231,83 ms` | `694,04 ms` / `691,09 ms` | `1053,07 ms` / `1012,74 ms` |
-| **1,5 vCPU Budget** | **Server** (Prometheus `POST_LOAD`, `5m`-Fenster) | `197,36 ms` | `411,35 ms` | `528,83 ms` |
+| **Unconstrained** | Client (regulär / alle HTTP) | `22,94 ms` / `22,44 ms` | `60,85 ms` / `60,39 ms` | `92,27 ms` / `91,27 ms` |
+| **Unconstrained** | Server (Prometheus `5m`) | `16,47 ms` | `49,91 ms` | `79,19 ms` |
+| **1,5 vCPU initial** | Client (regulär / alle HTTP) | `276,29 ms` / `231,83 ms` | `694,04 ms` / `691,09 ms` | `1053,07 ms` / `1012,74 ms` |
+| **1,5 vCPU initial** | Server (Prometheus `5m`) | `197,36 ms` | `411,35 ms` | `528,83 ms` |
+| **1,5 vCPU rebalanced (F1)** | Client (regulär / alle HTTP) | `300,44 ms` / `299,90 ms` | `800,18 ms` / `799,50 ms` | `1297,53 ms` / `1291,18 ms` |
+| **1,5 vCPU rebalanced (F1)** | Server (Prometheus `5m`) | `215,49 ms` | `446,02 ms` | `582,74 ms` |
 
-> **Determinismus-Nachweis (Seed `20261124`):** Alle Läufe (inkl. Unconstrained-Wiederholungslauf und 1,5-vCPU-Lauf) auf frisch zurückgesetzten Stacks liefern exakt identische Kohortenzahlen (`100.000` / `5.000` / `1.000`), exakt `0` Abweichung auf allen 5 Invarianten sowie centgenau identische Endsalden auf allen 10 Stichprobenkonten (`DE-BENCH-1352904-0000 = 11737.39 EUR`, `DE-BENCH-1352904-0001 = 12307.11 EUR`, …, `DE-BENCH-1352904-0009 = 12112.79 EUR`, je `782/782` Buchungen).
+> **Determinismus-Nachweis (`Seed 20261124`):** Alle drei Läufe liefern auf frisch zurückgesetzten Stacks centgenau identische Endsalden auf allen 10 Stichprobenkonten (`DE-BENCH-1352904-0000 = 11737.39 EUR` bis `DE-BENCH-1352904-0009 = 12112.79 EUR`, jeweils `782/782` Buchungen; geprüft in [`InvariantChecker`](load-generator/src/main/java/io/ledgerstream/loadgen/InvariantChecker.java)).
 
-## Deployment (Phase 11 — k3s, Kustomize, Sealed Secrets, NetworkPolicies, ArgoCD, GHCR + Cosign/SBOM)
+## Ressourcenbudget & Speicher-Aufteilung (F1, F2, F3)
 
-- **Kustomize (`deploy/kustomize/`):** Vollständige Trennung zwischen [`base/`](deploy/kustomize/base/kustomization.yaml) und reinen Delta-Overlays [`overlays/local/`](deploy/kustomize/overlays/local/kustomization.yaml) sowie [`overlays/prod/`](deploy/kustomize/overlays/prod/kustomization.yaml) (`LEDGER_ADMIN_ENABLED=false`, `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL=FULL`, unveränderliches `@sha256:`-Digest-Pinning ohne `:latest`).
-- **Ressourcen-Erzwingung (`deploy/kustomize/base/resource-quota.yaml`):** `ResourceQuota` erzwingt `requests.memory <= 1536Mi` (`1424Mi` belegt) und `requests.cpu <= 1500m` (`1300m` belegt) direkt bei Kubernetes-Admission; `LimitRange` setzt verbindliche Defaults (`64Mi`/`50m` Request, `256Mi`/`250m` Limit, `640Mi` Max).
-- **NetworkPolicies (`deploy/kustomize/base/network-policies.yaml`):** `default-deny-all` (Ingress + Egress), `allow-dns-egress` (UDP/TCP `53` zu CoreDNS) und explizite Service-Policies (`app` → `postgres`/`kafka`/`schema-registry`/`keycloak`; `frontend` → `app`/`keycloak`; `prometheus` → `app:8080`/`keycloak:9000`/`kafka-exporter:9308`).
-- **Sealed Secrets (`deploy/kustomize/base/sealed-secrets.yaml`):** Alle Zugangsdaten liegen ausschließlich als Bitnami `SealedSecret` vor — null Klartext-Secrets im Repository.
-- **SecurityContext & Probes:** Namespace mit `pod-security.kubernetes.io/enforce: restricted`; jeder Container läuft mit `runAsNonRoot: true`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]` und gezielten `emptyDir`-Mounts (u. a. Frontend `/tmp` für Runtime-`config.js`, Kafka `/opt/kafka/config`, Schema Registry `/etc/schema-registry`). Keycloak nutzt `startupProbe` (`/health/started`), separate `readinessProbe` ≠ `livenessProbe`; Kafka-KRaft prüft Readiness über `/opt/kafka/bin/kafka-broker-api-versions.sh`.
-- **GitOps & Supply Chain (ArgoCD + GHCR + Cosign + CycloneDX):** [`deploy/argocd/application.yaml`](deploy/argocd/application.yaml) synchronisiert `deploy/kustomize/overlays/prod` automatisiert mit `selfHeal: true` und `prune: true` (kein imperatives Apply in `.github/workflows/ci.yml`). Der CI-Job `container-supply-chain` pusht unveränderliche `sha`-Images nach GHCR, generiert CycloneDX-1.6-SBOMs via `syft`, signiert per Keyless-Cosign (Fulcio + Rekor), hängt SBOM-Attestations an und bricht bei fehlgeschlagener `cosign verify` / `cosign verify-attestation`-Prüfung ab. Rollbacks erfolgen rein deklarativ per `git revert` auf den vorherigen Digest (ArgoCD rollt automatisch zurück).
+> **Ehrliche Budget-Korrektur (F1/F2):** Die ursprüngliche Zielvorgabe (`1,5 GiB` RAM + `1,5 vCPU` für alle 8 Container) wird im **Unconstrained**-Lauf beim RAM gehalten (`anon = 1515,87 MiB`, `+20,13 MiB` Luft zu `1536 MiB`), nicht aber bei der CPU. Unter harter **`1,5 vCPU`**-Drosselung senkt die Umverteilung auf `keycloak 0.30 vCPU` + `-Xmx224m` (F1) den Keycloak-Working-Set um `35,05 MiB` (von `508,87` auf `473,82 MiB`), doch die reale Summe aller 8 Container unter `1,5 vCPU` bleibt bei **`1637,44 MiB` `anon`** (`+101,44 MiB` über `1536 MiB`; Kern-6 ohne Prometheus/Grafana: `1544,14 MiB`). Statt beide Kriterien gleichzeitig zu behaupten, korrigieren wir das k3s-Budget ehrlich auf **`1792Mi` (`1,75 GiB`) `requests.memory`** (`1728Mi` belegt) und exakt **`1500m` (`1,50 vCPU`) `requests.cpu`** ([`resource-quota.yaml`](deploy/kustomize/base/resource-quota.yaml), [ADR-0009](docs/adr/0009-ressourcenbudget-als-designzwang.md)).
+
+### Cgroup-v2-Speicheraufteilung im 100k-Peak (F1 rebalanced `1,5 vCPU`, `/sys/fs/cgroup/memory.stat`)
+
+Jede Zeile erfüllt exakt `anon + file + Kernel/Rest == memory.current` (F3):
+
+| Container | k3s `requests` (RAM / CPU) | k3s `limits` (RAM / CPU) | `memory.current` | davon `anon` (Working-Set) | davon `file` (reclaimbar) | davon `kernel` (`slab`) | Kernel+Rest (`total-anon-file`) |
+|---|---|---|---:|---:|---:|---:|---:|
+| `postgres` | `96Mi` / `350m` | `320Mi` / `500m` | `319,36 MiB` | `61,49 MiB` | `236,09 MiB` | `17,93` (`10,88`) | `21,77 MiB` |
+| `kafka` | `288Mi` / `200m` | `448Mi` / `500m` | `372,33 MiB` | `277,84 MiB` | `86,11 MiB` | `7,22` (`4,42`) | `8,38 MiB` |
+| `schema-registry` | `224Mi` / `100m` | `384Mi` / `250m` | `239,32 MiB` | `223,63 MiB` | `10,75 MiB` | `4,18` (`2,43`) | `4,94 MiB` |
+| `keycloak` | `480Mi` / `300m` | `640Mi` / `500m` | `492,07 MiB` | `473,82 MiB` | `11,99 MiB` | `4,52` (`1,87`) | `6,26 MiB` |
+| `app` | `512Mi` / `500m` | `640Mi` / `1000m` | `511,79 MiB` | `493,64 MiB` | `0,17 MiB` | `7,25` (`2,76`) | `17,98 MiB` |
+| `frontend` | `24Mi` / `20m` | `48Mi` / `100m` | `22,92 MiB` | `13,72 MiB` | `2,63 MiB` | `3,20` (`1,22`) | `6,57 MiB` |
+| `prometheus` | `32Mi` / `15m` | `192Mi` / `150m` | `29,27 MiB` | `26,10 MiB` | `1,28 MiB` | `1,22` (`0,48`) | `1,89 MiB` |
+| `grafana` | `72Mi` / `15m` | `192Mi` / `150m` | `73,48 MiB` | `67,20 MiB` | `1,18 MiB` | `4,41` (`3,04`) | `5,10 MiB` |
+| **Summe (8 Container)** | **`1728Mi` / `1500m`** *(Quota: `1792Mi` / `1500m`)* | **`2864Mi` / `3150m`** *(Quota: `2944Mi` / `4000m`)* | **`2060,54 MiB`** | **`1637,44 MiB`** | **`350,21 MiB`** | **`49,94` (`27,09`)** | **`72,89 MiB`** |
+
+- **Summenprobe (F3):** `1637,44 (anon) + 350,21 (file) + 72,89 (Kernel+Rest) = 2060,54 MiB == memory.current (2060,54 MiB)` (exakte Differenz `0,00 MiB`). Die Lücke zwischen `memory.current` und `anon + file` besteht aus Kernel-Strukturen (`kernel = 49,94 MiB`, darunter `slab = 27,09 MiB` für Dentry/Inode/Page-Tables), `sock`/`shmem` und cgroup-Accounting-Overhead.
+- **App-Non-Heap-Diagnose (`jcmd 1 VM.native_memory summary` im 100k-Peak):** `committed = 509,8 MiB` — Direct Buffers (`Other`) sind mit **`12,8 MiB` unauffällig** (kein Direct-Buffer-Leak). Der reale Non-Heap (`~220–255 MiB`) besteht aus Metaspace/Class/Shared (`98,2 MiB`, `17.952` Klassen), G1GC-Strukturen (`51,5 MiB`), CodeCache (`45,3 MiB`), Symbol-Tabelle (`25,9 MiB`), `178` Threads (`18,3 MiB`) und C2-Compiler-Spitzen (`~55 MiB`). Daher ist `512 MiB` das knappe Demo-Limit in Compose und `640 MiB` das Produktions-Limit in k3s.
+- **Limit-Overcommit `1,66×` erklärt (F2):** `requests.memory` (`1728Mi` Summe, je Pod ≥ gemessenem `anon`-Peak) ist die harte Scheduler-Reservierung in Kubernetes (`ResourceQuota`: `1792Mi`). `limits.memory` (`2864Mi` Summe = `1,66×` der Requests) sind **keine** Reservierungen, sondern Obergrenzen je Container für reclaimbaren Linux-Page-Cache (`postgres 236 MiB`, `kafka 86 MiB`) und nicht-gleichzeitige JVM-Bursts, um unnötige OOMKills zu vermeiden.
+- **Verifizierte PostgreSQL-Parameter (`SHOW`):** `shared_buffers = 64MB`, `work_mem = 4MB`, `maintenance_work_mem = 32MB`, `lock_timeout = 3s` ([`docker-compose.yml`](docker-compose.yml)).
+
+## Deployment & Supply Chain (k3s, Kustomize, ArgoCD, GHCR + Cosign/SBOM)
+
+- **Kustomize ([`deploy/kustomize/`](deploy/kustomize/)):** Strikte Trennung in [`base/`](deploy/kustomize/base/kustomization.yaml) und reine Delta-Overlays [`overlays/local/`](deploy/kustomize/overlays/local/kustomization.yaml) / [`overlays/prod/`](deploy/kustomize/overlays/prod/kustomization.yaml) (`LEDGER_ADMIN_ENABLED=false`, `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL=FULL`, unveränderliches `@sha256:`-Digest-Pinning ohne `:latest`; [ADR-0008](docs/adr/0008-kustomize-statt-helm.md)).
+- **Öffentliche GHCR-Images ohne `imagePullSecrets` (F6a):** Die Images `ghcr.io/timstallinger/ledger-stream-{app,frontend,keycloak}` sind **public** auf GHCR (nachgewiesen durch anonyme `cosign verify`-Prüfung im CI und erfolgreiche Pulls im k3s-Cluster ohne Pull-Secret); deshalb sind bewusst keine `imagePullSecrets` konfiguriert.
+- **Digest-Update-Konvention (F6d):** Commits, die einen `@sha256:`-Digest in [`overlays/prod/kustomization.yaml`](deploy/kustomize/overlays/prod/kustomization.yaml) aktualisieren, nennen den neuen Image-Digest explizit in der Commit-Nachricht, sodass `git log` ohne Diff nachvollziehbar bleibt.
+- **NetworkPolicies & SecurityContext:** Namespace mit `pod-security.kubernetes.io/enforce: restricted` ([`namespace.yaml`](deploy/kustomize/base/namespace.yaml)), `default-deny-all` + explizite Egress/Ingress-Policies ([`network-policies.yaml`](deploy/kustomize/base/network-policies.yaml)), `SealedSecrets` statt Klartext ([`sealed-secrets.yaml`](deploy/kustomize/base/sealed-secrets.yaml)), jeder Container mit `runAsNonRoot: true`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, Keycloak mit dedizierter `startupProbe` (`/health/started`), getrennter `readinessProbe` ≠ `livenessProbe` ([`keycloak-deployment.yaml`](deploy/kustomize/base/keycloak-deployment.yaml)).
+- **GitOps & Supply Chain:** [`deploy/argocd/application.yaml`](deploy/argocd/application.yaml) synchronisiert `deploy/kustomize/overlays/prod` mit `selfHeal: true` und `prune: true` (kein imperatives Apply in [`.github/workflows/ci.yml`](.github/workflows/ci.yml), durch Policy-Gate erzwungen). Der CI-Job `container-supply-chain` generiert CycloneDX-1.6-SBOMs (`syft`), signiert per Keyless-Cosign (Fulcio + Rekor) und verifiziert Signatur und Attestation unmittelbar per `cosign verify` / `cosign verify-attestation`.
+
+## Was dieses Projekt bewusst nicht löst
+
+Die ausführliche Begründung und Migrationspfade stehen in [docs/design-decisions.md](docs/design-decisions.md):
+
+1. **Keine Hochverfügbarkeit (HA):** Single-Broker Kafka KRaft (`RF=1`, [ADR-0004](docs/adr/0004-kraft-single-broker.md)) und Single-Instance PostgreSQL; Ausfall eines Brokers oder der Datenbank bedeutet Downtime bis zum Neustart.
+2. **Keine verteilten Transaktionen mit externen Systemen:** Effektive Exactly-once-Wirkung gilt an der Grenze PostgreSQL ↔ Kafka innerhalb von `ledger-stream`. Nachgelagerte Fremdsysteme (z. B. SEPA-Gateway) müssen eigene Idempotenz-Keys auswerten.
+3. **Keine automatische Outbox-Retention / Tabellen-Partitionierung:** Gesendete `outbox_events`-Zeilen werden nicht automatisch archiviert oder partitioniert (produktiver Ausbau: monatliche Range-Partitionierung auf `created_at` oder TTL-Cleanup nach Retention-Fenster).
+4. **Kein automatischer DLQ-Replay:** Einträge in `dlq_entries` bleiben bewusst liegen, bis ein Mensch mit Rolle `operator` Ursache und Auswirkung prüft und per `POST /admin/dlq/{id}/replay` freigibt ([docs/operations.md](docs/operations.md)).
+5. **Keine strikte Per-Account-Reihenfolge über Retry-Backoffs hinweg:** Bei technischen Fehlern weicht ein Event auf Retry-Topics aus; ein nachfolgendes Event desselben Kontos kann überholen (konkretes Szenario und 3 Alternativen in [docs/design-decisions.md](docs/design-decisions.md)).
