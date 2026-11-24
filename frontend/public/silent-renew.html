@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <title>OIDC Silent Renew</title>
+  </head>
+  <body>
+    <script>
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage(window.location.href, window.location.origin);
+      }
+    </script>
+  </body>
+</html>
