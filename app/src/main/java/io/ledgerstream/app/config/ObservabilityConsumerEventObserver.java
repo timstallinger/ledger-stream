@@ -20,7 +20,7 @@ public final class ObservabilityConsumerEventObserver implements ConsumerEventOb
     private final Counter duplicateOutcomeCounter;
     private final Counter poisonOutcomeCounter;
     private final Counter duplicateRejectedCounter;
-    private final Counter poisonRejectedCounter;
+    private final Counter poisonTotalCounter;
     private final Counter retriesCounter;
 
     public ObservabilityConsumerEventObserver(final MeterRegistry meterRegistry) {
@@ -38,11 +38,10 @@ public final class ObservabilityConsumerEventObserver implements ConsumerEventOb
                 .register(meterRegistry);
         this.duplicateRejectedCounter = Counter.builder("consumer_duplicates_rejected_total")
                 .tag("reason", "duplicate")
-                .description("Total number of rejected consumer events by closed-set reason (duplicate or poison)")
+                .description("Total number of genuine duplicate consumer events rejected via UNIQUE(event_id)")
                 .register(meterRegistry);
-        this.poisonRejectedCounter = Counter.builder("consumer_duplicates_rejected_total")
-                .tag("reason", "poison")
-                .description("Total number of rejected consumer events by closed-set reason (duplicate or poison)")
+        this.poisonTotalCounter = Counter.builder("consumer_poison_total")
+                .description("Total number of non-retryable poison events routed directly to DLQ")
                 .register(meterRegistry);
         this.retriesCounter = Counter.builder("consumer_retries_total")
                 .description("Total number of non-blocking consumer retry attempts executed")
@@ -64,7 +63,7 @@ public final class ObservabilityConsumerEventObserver implements ConsumerEventOb
     @Override
     public void onPoisonRejected(final String eventIdOrKey, final String reason) {
         poisonOutcomeCounter.increment();
-        poisonRejectedCounter.increment();
+        poisonTotalCounter.increment();
         LOG.warn("Rejected poison event directly to DLQ: reason={}", reason);
     }
 

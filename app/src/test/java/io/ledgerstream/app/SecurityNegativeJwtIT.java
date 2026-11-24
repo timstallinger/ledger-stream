@@ -100,6 +100,25 @@ final class SecurityNegativeJwtIT {
         assertUnauthorizedRfc7807(response);
     }
 
+    @Test
+    void corsExposesIdempotencyReplayedAndCorrelationHeadersForAllowedOrigin() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setOrigin("http://localhost:5173");
+        headers.setBearerAuth(TestJwtSupport.instance().viewerToken());
+
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/accounts",
+                HttpMethod.GET,
+                new HttpEntity<>(headers),
+                String.class
+        );
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getHeaders().getAccessControlAllowOrigin()).isEqualTo("http://localhost:5173");
+        assertThat(response.getHeaders().getAccessControlExposeHeaders())
+                .contains("Idempotency-Replayed", "X-Correlation-Id", "Retry-After");
+    }
+
     private ResponseEntity<String> getWithBearer(final String path, final String token) {
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(token);

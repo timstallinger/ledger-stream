@@ -136,15 +136,20 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Duplikate & Poison nach reason",
-      "description": "Abgewiesene Consumer-Events aufgeschlüsselt nach geschlossenem Label reason (duplicate vs. poison).",
+      "title": "Consumer-Duplikate & Poison-Events",
+      "description": "Echte Consumer-Duplikate (consumer_duplicates_rejected_total{reason=\"duplicate\"}) getrennt von Poison-Events (consumer_poison_total).",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (reason) (consumer_duplicates_rejected_total)",
-          "legendFormat": "{{reason}}"
+          "expr": "consumer_duplicates_rejected_total{reason=\"duplicate\"}",
+          "legendFormat": "duplicates"
+        },
+        {
+          "refId": "B",
+          "expr": "consumer_poison_total",
+          "legendFormat": "poison"
         }
       ],
       "fieldConfig": {

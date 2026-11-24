@@ -6,6 +6,9 @@ import java.net.http.HttpClient;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Framework-free CLI entry point for Phase 10 load generation and automated invariant verification.
@@ -51,19 +54,41 @@ public final class LoadGeneratorMain {
                 args.prometheusUrl()
         );
 
+        AtomicLong maxOutboxUnsent = new AtomicLong(0L);
+        ScheduledExecutorService outboxSampler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "outbox-unsent-sampler");
+            t.setDaemon(true);
+            return t;
+        });
+        outboxSampler.scheduleAtFixedRate(() -> {
+            try {
+                double unsent = prometheusClient.sumMetricMatching(
+                        prometheusClient.scrapeActuatorMetrics(),
+                        "outbox_unsent",
+                        null
+                );
+                maxOutboxUnsent.accumulateAndGet(Math.round(unsent), Math::max);
+            } catch (Exception ignored) {
+                // best-effort live peak sampling
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+
         LoadRunner.RunResult runResult;
         try (PoisonEventProducer poisonProducer = args.poisonCount() > 0
                 ? new PoisonEventProducer(args.kafkaBootstrap(), args.schemaRegistryUrl(), args.topic())
                 : null) {
             LoadRunner runner = new LoadRunner(args, httpClient, objectMapper, tokenProvider, poisonProducer);
             runResult = runner.execute();
+        } finally {
+            outboxSampler.shutdownNow();
         }
 
         // Capture server-side metrics immediately after measured HTTP run (and again after drain)
         PrometheusClient.ServerMetricsSnapshot postLoadServer = prometheusClient.captureServerSnapshot("5m");
+        maxOutboxUnsent.accumulateAndGet(Math.round(postLoadServer.outboxUnsentGauge()), Math::max);
 
         if (args.skipInvariants()) {
-            printSummary(args, runResult, postLoadServer, null);
+            printSummary(args, runResult, postLoadServer, null, maxOutboxUnsent.get());
             return 0;
         }
 
@@ -71,7 +96,7 @@ public final class LoadGeneratorMain {
         InvariantChecker.VerificationReport report = checker.waitAndVerify(runResult);
         PrometheusClient.ServerMetricsSnapshot postDrainServer = prometheusClient.captureServerSnapshot("5m");
 
-        printSummary(args, runResult, postLoadServer, report);
+        printSummary(args, runResult, postLoadServer, report, maxOutboxUnsent.get());
         printPrometheusSnapshot("POST_DRAIN_SERVER_METRICS", postDrainServer);
 
         return report.allPassed() ? 0 : 1;
@@ -81,7 +106,8 @@ public final class LoadGeneratorMain {
             final LoadGeneratorArgs args,
             final LoadRunner.RunResult run,
             final PrometheusClient.ServerMetricsSnapshot server,
-            final InvariantChecker.VerificationReport report
+            final InvariantChecker.VerificationReport report,
+            final long maxOutboxUnsent
     ) {
         System.out.println();
         System.out.println("============================================================");
@@ -153,7 +179,8 @@ public final class LoadGeneratorMain {
             System.out.println("------------------------------------------------------------");
             System.out.printf(
                     Locale.ROOT,
-                    "Drain time:                 %.2f s (outbox_unsent remaining=%d)%n",
+                    "Max outbox_unsent (live):   %d | Drain time: %.2f s (outbox_unsent remaining=%d)%n",
+                    maxOutboxUnsent,
                     report.drainSeconds(),
                     report.outboxUnsentRemaining()
             );

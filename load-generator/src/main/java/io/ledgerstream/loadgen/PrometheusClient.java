@@ -166,7 +166,7 @@ public final class PrometheusClient {
                 consumerRate,
                 sumMetricMatching(actuator, "consumer_processed_total", "outcome=\"processed\""),
                 sumMetricMatching(actuator, "consumer_duplicates_rejected_total", "reason=\"duplicate\""),
-                sumMetricMatching(actuator, "consumer_duplicates_rejected_total", "reason=\"poison\""),
+                sumMetricMatching(actuator, "consumer_poison_total", null),
                 sumMetricMatching(actuator, "dlq_entries_unhandled", null),
                 sumMetricMatching(actuator, "outbox_unsent", null)
         );

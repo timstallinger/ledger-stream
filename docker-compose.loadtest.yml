@@ -1,7 +1,7 @@
-# Optional Compose override for Phase 10 load-generator benchmark & SQL invariant checks from host.
+# Optional Compose override for Phase 10 unconstrained benchmark & M2/M3 diagnostics.
 # Keeps all memory limits (mem_limit) 100% identical to docker-compose.yml while exposing
-# PostgreSQL on loopback 5433 and lifting Compose CPU throttling so 6 Kafka partitions,
-# consumer concurrency=6 and 32 HTTP client threads can execute in parallel.
+# PostgreSQL on loopback 5433, enabling JVM NativeMemoryTracking=summary (M3), and
+# unlocking CPU caps so 6 Kafka partitions, consumer concurrency=6 and 32 HTTP threads run in parallel.
 services:
   postgres:
     ports:
@@ -15,6 +15,8 @@ services:
     cpus: 2.0
   app:
     cpus: 6.0
+    environment:
+      JAVA_OPTS: "${APP_JAVA_OPTS:--XX:MaxRAMPercentage=60.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -XX:NativeMemoryTracking=summary}"
   prometheus:
     cpus: 1.0
   grafana:

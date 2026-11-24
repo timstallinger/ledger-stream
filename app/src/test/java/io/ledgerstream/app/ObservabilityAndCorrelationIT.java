@@ -220,6 +220,7 @@ final class ObservabilityAndCorrelationIT {
             assertThat(metricsBody).contains("outbox_events_relayed_total{result=\"success\",type=\"BookingCreated\"}");
             assertThat(metricsBody).contains("consumer_processed_total{outcome=\"processed\"}");
             assertThat(metricsBody).contains("consumer_duplicates_rejected_total{reason=\"duplicate\"}");
+            assertThat(metricsBody).contains("consumer_poison_total");
             assertThat(metricsBody).contains("consumer_retries_total");
             assertThat(metricsBody).contains("dlq_entries_unhandled");
             assertThat(metricsBody).contains("dlq_replayed_total");
