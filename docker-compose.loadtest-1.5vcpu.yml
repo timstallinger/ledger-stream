@@ -1,26 +1,28 @@
-# Optional Compose override for M1 1.5-vCPU budget benchmark.
-# Enforces exact 1.50 vCPU sum across all 8 containers (app 0.6 + postgres 0.35 + kafka 0.25 +
-# schema-registry 0.15 + keycloak 0.10 + frontend/prometheus/grafana 0.05 = 1.50 vCPU) while
-# keeping all memory limits identical to docker-compose.yml.
+# Optional Compose override for F1 balanced 1.5-vCPU budget benchmark.
+# Exact 1.50 vCPU sum: app 0.50 + keycloak 0.30 + postgres 0.35 + kafka 0.20 +
+# schema-registry 0.10 + frontend 0.02 + prometheus 0.015 + grafana 0.015 = 1.50 vCPU.
+# Keycloak heap capped at -Xmx224m to eliminate GC backlog seen at 0.10 vCPU.
 services:
   postgres:
     ports:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     cpus: 0.35
   kafka:
-    cpus: 0.25
+    cpus: 0.20
     healthcheck:
       retries: 60
   schema-registry:
-    cpus: 0.15
-    healthcheck:
-      retries: 80
-  keycloak:
     cpus: 0.10
     healthcheck:
-      retries: 180
+      retries: 100
+  keycloak:
+    cpus: 0.30
+    environment:
+      JAVA_OPTS_APPEND: "-Xms128m -Xmx224m"
+    healthcheck:
+      retries: 120
   app:
-    cpus: 0.60
+    cpus: 0.50
     environment:
       JAVA_OPTS: "${APP_JAVA_OPTS:--XX:MaxRAMPercentage=60.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -XX:NativeMemoryTracking=summary}"
     healthcheck:
@@ -32,4 +34,4 @@ services:
   grafana:
     cpus: 0.015
     healthcheck:
-      retries: 100
+      retries: 120
