@@ -12,6 +12,16 @@ Der schwierige Teil event-getriebener Systeme ist nicht das Produzieren einer Ka
 
 `ledger-stream` löst diese Probleme explizit und ohne verdeckende Bibliotheken (kein Debezium, kein Spring Cloud Stream, kein Axon, kein Lombok, kein JPA/Hibernate).
 
+## Effektive Exactly-once-Semantik
+
+In einem verteilten System aus PostgreSQL und Kafka existiert kein magisches „Exactly-once-Delivery“ über die Netzwerkgrenze. `ledger-stream` trennt deshalb bewusst drei Schichten:
+
+| Schicht | Garantie | Mechanismus in `ledger-stream` |
+|---|---|---|
+| **Zustellung (Delivery)** | **At-least-once** | Transactional Outbox (`FOR UPDATE SKIP LOCKED`, Batch 500) publiziert nach Commit; Absturz zwischen Kafka-Ack und `markSent` führt zu erneutem Publish. |
+| **Verarbeitung (Processing)** | **At-least-once** | Manuelles Offset-Commit erst nach DB-Commit; Absturz zwischen DB-Commit und Offset-Commit sowie Non-Blocking Retry Topics liefern Records erneut aus. |
+| **Wirkung (Effect)** | **Genau einmal (Exactly-once)** | Schreibseite: `UNIQUE (account_id, idempotency_key)` + byte-gleiches Replay gecachter `2xx`-Antworten. Leseseite: `INSERT INTO processed_events ... ON CONFLICT DO NOTHING` in derselben Transaktion wie das `account_summary`-Update. |
+
 ## Architektur
 
 Die vollständige Architektur inklusive Hexagonal-Schnitt und End-to-End-Sequenzdiagramm ist in [docs/architecture.md](docs/architecture.md) dokumentiert.
@@ -86,9 +96,39 @@ lock_timeout         = 3s
   - `dlq_entries_unhandled` (Gauge): offene DLQ-Einträge (`replayed_at IS NULL`) — Zielwert `0`, maßgeblich für Alarmierung.
   - `dlq_replayed_total` (Counter): über `POST /admin/dlq/{id}/replay` erneut eingestellte Einträge.
   - `consumer_retries_total` (Counter): ausgelöste nicht-blockierende Retry-Versuche (Frühindikator vor DLQ-Wachstum).
-- **Offener Sicherheitspunkt (wird in Phase 7 geschlossen):** `POST /admin/dlq/{id}/replay` und `GET /admin/dlq` sind über `ledger.admin.enabled=false` standardmäßig abgeschaltet (liefern `404`), bis in Phase 7 Keycloak 26 + OIDC und die Rolle `operator` verdrahtet sind. Im k3s-Kustomize-Overlay ([deploy/kustomize/overlays/prod/kustomization.yaml](deploy/kustomize/overlays/prod/kustomization.yaml)) ist `LEDGER_ADMIN_ENABLED=false` zusätzlich explizit gepinnt.
-- **Zwei unabhängige Replay-Garantien:** Ein erneuter Replay eines bereits wieder eingespielten DLQ-Eintrags wird bereits an der Admin-API über den `replayed_at`-Guard mit HTTP **`409 Conflict`** abgewiesen; selbst bei einem manuellen Re-Publish am Admin-Endpunkt vorbei verhindert `UNIQUE (event_id)` auf `processed_events` eine doppelte Buchungswirkung. Scheitert ein Replay erneut, öffnet der Partial-Unique-Index `uq_dlq_entries_unhandled_event_id` den bestehenden Eintrag wieder und erhöht `attempt_count`, statt eine zweite offene Zeile anzulegen.
+- **Admin-Endpunkte abgesichert (Phase 7):** `GET /admin/dlq` und `POST /admin/dlq/{id}/replay` erfordern `ledger.admin.enabled=true` **und** ein gültiges OIDC-Token mit Rolle `operator` (`ROLE_operator`). Standardmäßig (`ledger.admin.enabled=false`, auch im k3s-Overlay [deploy/kustomize/overlays/prod/kustomization.yaml](deploy/kustomize/overlays/prod/kustomization.yaml) explizit gepinnt) liefern sie `404` vor `401`.
+- **Zwei unabhängige Replay-Garantien & unveränderliche Replay-Historie:** Ein erneuter Replay eines bereits wieder eingespielten DLQ-Eintrags wird an der Admin-API über den `replayed_at`-Guard mit HTTP **`409 Conflict`** abgewiesen; selbst bei einem manuellen Re-Publish am Admin-Endpunkt vorbei verhindert `UNIQUE (event_id)` auf `processed_events` eine doppelte Buchungswirkung. Jeder Replay-Versuch wird unveränderlich in `dlq_replay_attempts` protokolliert; scheitert ein Replay erneut oder trifft derselbe unlesbare Deserialisierungs-Poison mehrfach ein, dedupliziert der Partial-Unique-Index `uq_dlq_entries_unhandled_dedup_key` auf `COALESCE(event_id::text, payload_sha256) WHERE replayed_at IS NULL` in eine einzige offene Zeile und erhöht `attempt_count`.
 - Vollständiges Runbook (Analyse, Replay-Kriterien, Begründung Outbox `10` vs. Consumer `5` Retries): [docs/operations.md](docs/operations.md).
+
+## Security (Keycloak 26 + OIDC Resource Server)
+
+### Rollenmodell (Least Privilege)
+
+| Rolle | Authority | Erlaubte Endpunkte | Bewusst verweigert (`403`) |
+|---|---|---|---|
+| `viewer` | `ROLE_viewer` | `GET /api/v1/accounts/**` | `POST /api/v1/accounts/**`, `/admin/dlq/**` |
+| `writer` | `ROLE_writer` | `GET` & `POST /api/v1/accounts/**` (Kontoanlage, Buchung, Storno) | `/admin/dlq/**` |
+| `operator` | `ROLE_operator` | `GET` & `POST /api/v1/accounts/**` sowie `/admin/dlq/**` (bei `ledger.admin.enabled=true`) | — |
+
+**Entscheidung:** Drei Rollen statt zwei — Buchungs-Clients (`writer`) können geschäftliche Buchungen ausführen, dürfen aber niemals DLQ-Payloads inspizieren oder Replays auslösen (`Separation of Duties`).
+
+### Durchsetzung & Härtung
+
+- **404-vor-401:** Ist `ledger.admin.enabled=false` (Default), nimmt eine `@Order(1)`-`SecurityFilterChain` den Pfad `/admin/**` vor der OIDC-Prüfung heraus; ohne `DlqAdminController` antwortet Spring konsistent mit **`404 Not Found`** (unauthentifiziert, als `viewer` und als `operator`), ohne die Existenz der Admin-Route zu verraten.
+- **Explizite Token-Prüfung:** `JwtAuthenticationConverter` mappt `realm_access.roles` explizit auf `ROLE_*`. Der `NimbusJwtDecoder` prüft Signatur über JWKS (kein `alg=none`, kein fremder Key), `exp`/`nbf`, `iss` sowie explizit `aud = ledger-stream-api`. `401` und `403` liefern strukturierte RFC-7807-Antworten (`application/problem+json`).
+- **Keine Secrets im Repository:** [keycloak/realm-export.json](keycloak/realm-export.json) enthält den Public-PKCE-Client `ledger-stream-spa` (`S256`, ohne Secret) für Phase 8 sowie den vertraulichen Client `ledger-stream-cli` mit Platzhalter `${LEDGER_CLI_CLIENT_SECRET}` (Injektion per Env / Kubernetes `secretKeyRef` in [deploy/kustomize/base/keycloak-deployment.yaml](deploy/kustomize/base/keycloak-deployment.yaml)).
+
+## Ressourcenbudget (gemessene `docker stats` nach Phase 7)
+
+Keycloak 26 läuft mit `start --optimized --import-realm`, `-Xmx256m`, `KC_CACHE=local` auf der **bestehenden** PostgreSQL-16-Instanz (eigene Datenbank `keycloak`, kein H2, kein Dev-Mode, kein zweiter Postgres-Container).
+
+| Container | Limit | Tuning | Gemessener RSS | Auslastung |
+|---|---:|---|---:|---:|
+| `ledger-stream-postgres` | `320 MiB` | `shared_buffers=64MB`, `work_mem=4MB`, `lock_timeout=3s` (DBs: `ledger` + `keycloak`) | `45,84 MiB` | `14,33 %` |
+| `ledger-stream-kafka` | `448 MiB` | KRaft, `-Xms128m -Xmx192m`, `dedupe_buffer=16MB` | `202,20 MiB` | `45,13 %` |
+| `ledger-stream-schema-registry` | `384 MiB` | `FULL`, `-Xmx192m -XX:MaxMetaspaceSize=96m` | `201,20 MiB` | `52,39 %` |
+| `ledger-stream-keycloak` | `512 MiB` | `start --optimized`, `KC_DB=postgres`, `KC_CACHE=local`, `-Xms128m -Xmx256m` | `400,20 MiB` | `78,17 %` |
+| **Summe Infrastruktur (4 Container)** | — | **Zielbudget Gesamtstack: `1536 MiB` (1,5 GiB)** | **`849,44 MiB`** | **Puffer: `686,56 MiB`** |
 
 ## Schema-Evolution (Avro + Confluent Schema Registry)
 

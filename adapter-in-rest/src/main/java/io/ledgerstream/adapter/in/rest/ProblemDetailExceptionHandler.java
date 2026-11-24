@@ -22,6 +22,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.net.URI;
 import java.util.LinkedHashMap;
@@ -130,6 +131,20 @@ public final class ProblemDetailExceptionHandler {
                 "Bad request",
                 "BAD_REQUEST",
                 exception.getMessage(),
+                request
+        );
+    }
+
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ProblemDetail handleNoResourceFound(
+            final NoResourceFoundException exception,
+            final HttpServletRequest request
+    ) {
+        return buildProblem(
+                HttpStatus.NOT_FOUND,
+                "Resource not found",
+                "NOT_FOUND",
+                "The requested resource does not exist",
                 request
         );
     }

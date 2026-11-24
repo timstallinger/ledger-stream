@@ -5,6 +5,7 @@ import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import io.confluent.kafka.serializers.KafkaAvroDeserializerConfig;
 import io.ledgerstream.adapter.out.messaging.KafkaTopicProperties;
 import io.ledgerstream.adapter.out.messaging.avro.LedgerBookingEvent;
+import io.ledgerstream.app.security.TestJwtSupport;
 import io.ledgerstream.application.port.in.CreateBookingCommand;
 import io.ledgerstream.application.port.in.CreateBookingUseCase;
 import io.ledgerstream.application.port.in.RelayOutboxUseCase;
@@ -114,6 +115,7 @@ final class TransactionalOutboxIT {
     @DynamicPropertySource
     static void schemaRegistryProperties(final DynamicPropertyRegistry registry) {
         registry.add("spring.kafka.producer.properties.schema.registry.url", TransactionalOutboxIT::schemaRegistryUrl);
+        TestJwtSupport.registerProperties(registry);
     }
 
     private static String schemaRegistryUrl() {
@@ -461,6 +463,7 @@ final class TransactionalOutboxIT {
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().writerToken());
         headers.set("Idempotency-Key", "idem-cxl-storno");
         ResponseEntity<String> cancelled = restTemplate.postForEntity(
                 "/api/v1/accounts/" + accountId + "/bookings/" + originalBookingId + "/cancel",
@@ -535,6 +538,7 @@ final class TransactionalOutboxIT {
     private String createAccount(final String accountNumber) throws Exception {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().writerToken());
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/accounts",
                 new HttpEntity<>("{\"accountNumber\":\"" + accountNumber + "\",\"currency\":\"EUR\"}", headers),
@@ -554,6 +558,7 @@ final class TransactionalOutboxIT {
     ) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().writerToken());
         headers.set("Idempotency-Key", idempotencyKey);
         String body = """
                 {

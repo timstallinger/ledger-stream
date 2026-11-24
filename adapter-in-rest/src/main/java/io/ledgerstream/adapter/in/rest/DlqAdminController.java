@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.security.Principal;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -43,9 +44,13 @@ public final class DlqAdminController {
     @PostMapping("/{id}/replay")
     public ResponseEntity<DlqEntryResponse> replay(
             @PathVariable final UUID id,
-            @Valid @RequestBody(required = false) final ReplayDlqRequest request
+            @Valid @RequestBody(required = false) final ReplayDlqRequest request,
+            final Principal principal
     ) {
-        String replayedBy = request != null ? request.replayedBy() : null;
+        String requestedBy = request != null ? request.replayedBy() : null;
+        String replayedBy = (requestedBy != null && !requestedBy.isBlank())
+                ? requestedBy
+                : (principal != null ? principal.getName() : null);
         String note = request != null ? request.note() : null;
         DlqEntry replayed = replayDlqUseCase.replay(new ReplayDlqCommand(id, replayedBy, note));
         return ResponseEntity.ok(DlqEntryResponse.from(replayed));

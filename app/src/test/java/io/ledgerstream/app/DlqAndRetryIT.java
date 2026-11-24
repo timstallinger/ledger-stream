@@ -7,6 +7,7 @@ import io.ledgerstream.adapter.in.messaging.RawPayloadPreservingAvroDeserializer
 import io.ledgerstream.adapter.out.messaging.KafkaTopicProperties;
 import io.ledgerstream.adapter.out.messaging.avro.LedgerBookingEvent;
 import io.ledgerstream.adapter.out.persistence.JdbcAccountSummaryRepository;
+import io.ledgerstream.app.security.TestJwtSupport;
 import io.ledgerstream.application.port.out.AccountSummary;
 import io.ledgerstream.application.port.out.AccountSummaryRepository;
 import io.ledgerstream.application.port.out.DlqEntry;
@@ -127,6 +128,7 @@ final class DlqAndRetryIT {
     static void schemaRegistryProperties(final DynamicPropertyRegistry registry) {
         registry.add("spring.kafka.producer.properties.schema.registry.url", DlqAndRetryIT::schemaRegistryUrl);
         registry.add("spring.kafka.consumer.properties.schema.registry.url", DlqAndRetryIT::schemaRegistryUrl);
+        TestJwtSupport.registerProperties(registry);
     }
 
     private static String schemaRegistryUrl() {
@@ -340,8 +342,7 @@ final class DlqAndRetryIT {
         double replayedBefore = counterValue("dlq_replayed_total");
         faultSwitch.clearFailure(failingEventId);
 
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpHeaders headers = operatorJsonHeaders();
         ResponseEntity<String> replayResponse = restTemplate.postForEntity(
                 "/admin/dlq/" + dlqEntry.id() + "/replay",
                 new HttpEntity<>("{\"replayedBy\":\"operator-t3\",\"note\":\"DB recovered\"}", headers),
@@ -394,8 +395,7 @@ final class DlqAndRetryIT {
         DlqEntry dlqEntry = findDlqEntryByEventId(eventId).orElseThrow();
 
         faultSwitch.clearFailure(eventId);
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpHeaders headers = operatorJsonHeaders();
 
         // First replay succeeds
         ResponseEntity<String> firstReplay = restTemplate.postForEntity(
@@ -499,8 +499,7 @@ final class DlqAndRetryIT {
         int registeredId = registerSchema("ledger.events-t5-fix-" + shortId() + "-value", distinctSchemaJson);
         assertThat(registeredId).isEqualTo(nextSchemaId);
 
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpHeaders headers = operatorJsonHeaders();
         ResponseEntity<String> replayResponse = restTemplate.postForEntity(
                 "/admin/dlq/" + poisonEntry.id() + "/replay",
                 new HttpEntity<>("{\"replayedBy\":\"schema-admin\",\"note\":\"Registered missing schema\"}", headers),
@@ -541,8 +540,7 @@ final class DlqAndRetryIT {
         assertThat(firstFailure.attemptCount()).isEqualTo(5);
         assertThat(gaugeValue("dlq_entries_unhandled")).isEqualTo(1.0);
 
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpHeaders headers = operatorJsonHeaders();
 
         // Replay #1 WITHOUT clearing fault -> fails another 5 attempts -> attempt_count = 10
         ResponseEntity<String> replay1 = restTemplate.postForEntity(
@@ -742,9 +740,15 @@ final class DlqAndRetryIT {
         return gauge.value();
     }
 
-    private String createAccount(final String accountNumber) throws Exception {
+    private static HttpHeaders operatorJsonHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().operatorToken());
+        return headers;
+    }
+
+    private String createAccount(final String accountNumber) throws Exception {
+        HttpHeaders headers = operatorJsonHeaders();
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/accounts",
                 new HttpEntity<>("{\"accountNumber\":\"" + accountNumber + "\",\"currency\":\"EUR\"}", headers),

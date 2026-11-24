@@ -2,6 +2,7 @@ package io.ledgerstream.app;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.ledgerstream.app.security.TestJwtSupport;
 import io.ledgerstream.application.port.out.AccountRepository;
 import io.ledgerstream.domain.exception.InsufficientBalanceException;
 import io.ledgerstream.domain.model.Account;
@@ -15,10 +16,13 @@ import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -58,6 +62,11 @@ final class AccountBookingApiIT {
     static final KafkaContainer KAFKA =
             new KafkaContainer(DockerImageName.parse("apache/kafka:3.9.1"));
 
+    @DynamicPropertySource
+    static void securityProperties(final DynamicPropertyRegistry registry) {
+        TestJwtSupport.registerProperties(registry);
+    }
+
     @Autowired
     private TestRestTemplate restTemplate;
 
@@ -95,16 +104,13 @@ final class AccountBookingApiIT {
         );
         assertThat(debitResponse.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
-        ResponseEntity<String> accountGet = restTemplate.getForEntity("/api/v1/accounts/" + accountId, String.class);
+        ResponseEntity<String> accountGet = getAuthorized("/api/v1/accounts/" + accountId);
         assertThat(accountGet.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode accountJson = objectMapper.readTree(accountGet.getBody());
         assertThat(accountJson.get("balance").decimalValue()).isEqualByComparingTo("100.25");
         assertThat(accountJson.get("version").asLong()).isEqualTo(2L);
 
-        ResponseEntity<String> bookingsGet = restTemplate.getForEntity(
-                "/api/v1/accounts/" + accountId + "/bookings",
-                String.class
-        );
+        ResponseEntity<String> bookingsGet = getAuthorized("/api/v1/accounts/" + accountId + "/bookings");
         assertThat(bookingsGet.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode bookingsJson = objectMapper.readTree(bookingsGet.getBody());
         assertThat(bookingsJson.size()).isEqualTo(2);
@@ -248,7 +254,7 @@ final class AccountBookingApiIT {
                 .single();
         assertThat(bookingCount).isEqualTo(1);
 
-        ResponseEntity<String> accountGet = restTemplate.getForEntity("/api/v1/accounts/" + accountId, String.class);
+        ResponseEntity<String> accountGet = getAuthorized("/api/v1/accounts/" + accountId);
         assertThat(objectMapper.readTree(accountGet.getBody()).get("balance").decimalValue())
                 .isEqualByComparingTo("10.00");
     }
@@ -268,8 +274,7 @@ final class AccountBookingApiIT {
         );
         String bookingId = objectMapper.readTree(created.getBody()).get("id").asText();
 
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpHeaders headers = jsonAuthHeaders();
         headers.set("Idempotency-Key", "idem-cancel-" + accountNumber);
         ResponseEntity<String> cancelled = restTemplate.postForEntity(
                 "/api/v1/accounts/" + accountId + "/bookings/" + bookingId + "/cancel",
@@ -282,7 +287,7 @@ final class AccountBookingApiIT {
         assertThat(counterJson.get("type").asText()).isEqualTo("DEBIT");
         assertThat(counterJson.get("originalBookingId").asText()).isEqualTo(bookingId);
 
-        ResponseEntity<String> accountGet = restTemplate.getForEntity("/api/v1/accounts/" + accountId, String.class);
+        ResponseEntity<String> accountGet = getAuthorized("/api/v1/accounts/" + accountId);
         assertThat(objectMapper.readTree(accountGet.getBody()).get("balance").decimalValue())
                 .isEqualByComparingTo("0.00");
 
@@ -298,8 +303,7 @@ final class AccountBookingApiIT {
         String accountNumber = "DE-" + UUID.randomUUID().toString().substring(0, 8);
         String accountId = createAccount(accountNumber, "EUR");
 
-        HttpHeaders noIdempotencyHeader = new HttpHeaders();
-        noIdempotencyHeader.setContentType(MediaType.APPLICATION_JSON);
+        HttpHeaders noIdempotencyHeader = jsonAuthHeaders();
         ResponseEntity<String> missingHeader = restTemplate.postForEntity(
                 "/api/v1/accounts/" + accountId + "/bookings",
                 new HttpEntity<>(
@@ -330,18 +334,27 @@ final class AccountBookingApiIT {
         );
         assertThat(tooLongKey.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
 
-        ResponseEntity<String> notFound = restTemplate.getForEntity(
-                "/api/v1/accounts/" + UUID.randomUUID(),
-                String.class
-        );
+        ResponseEntity<String> notFound = getAuthorized("/api/v1/accounts/" + UUID.randomUUID());
         assertThat(notFound.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
         assertThat(objectMapper.readTree(notFound.getBody()).get("errorCode").asText())
                 .isEqualTo("ACCOUNT_NOT_FOUND");
     }
 
-    private String createAccount(final String accountNumber, final String currency) throws Exception {
+    private ResponseEntity<String> getAuthorized(final String path) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(TestJwtSupport.instance().viewerToken());
+        return restTemplate.exchange(path, HttpMethod.GET, new HttpEntity<>(headers), String.class);
+    }
+
+    private static HttpHeaders jsonAuthHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().writerToken());
+        return headers;
+    }
+
+    private String createAccount(final String accountNumber, final String currency) throws Exception {
+        HttpHeaders headers = jsonAuthHeaders();
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/accounts",
                 new HttpEntity<>(
@@ -362,8 +375,7 @@ final class AccountBookingApiIT {
             final String reference,
             final String idempotencyKey
     ) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpHeaders headers = jsonAuthHeaders();
         headers.set("Idempotency-Key", idempotencyKey);
         String body = """
                 {

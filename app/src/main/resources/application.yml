@@ -13,6 +13,12 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${OIDC_ISSUER_URI:http://localhost:8180/realms/ledger-stream}
+          jwk-set-uri: ${OIDC_JWK_SET_URI:http://localhost:8180/realms/ledger-stream/protocol/openid-connect/certs}
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
@@ -35,6 +41,8 @@ server:
 ledger:
   admin:
     enabled: ${LEDGER_ADMIN_ENABLED:false}
+  security:
+    expected-audience: ${OIDC_EXPECTED_AUDIENCE:ledger-stream-api}
   kafka:
     topics:
       ledger-events: ${LEDGER_EVENTS_TOPIC:ledger.events}

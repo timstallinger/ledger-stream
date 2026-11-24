@@ -8,6 +8,7 @@ import io.ledgerstream.adapter.in.messaging.LedgerEventRecordProcessor;
 import io.ledgerstream.adapter.in.messaging.RawPayloadPreservingAvroDeserializer;
 import io.ledgerstream.adapter.out.messaging.KafkaTopicProperties;
 import io.ledgerstream.adapter.out.messaging.avro.LedgerBookingEvent;
+import io.ledgerstream.app.security.TestJwtSupport;
 import io.ledgerstream.application.port.out.AccountSummary;
 import io.ledgerstream.application.port.out.AccountSummaryRepository;
 import io.ledgerstream.domain.model.AccountId;
@@ -116,6 +117,7 @@ final class IdempotentConsumerIT {
     static void schemaRegistryProperties(final DynamicPropertyRegistry registry) {
         registry.add("spring.kafka.producer.properties.schema.registry.url", IdempotentConsumerIT::schemaRegistryUrl);
         registry.add("spring.kafka.consumer.properties.schema.registry.url", IdempotentConsumerIT::schemaRegistryUrl);
+        TestJwtSupport.registerProperties(registry);
     }
 
     private static String schemaRegistryUrl() {
@@ -534,6 +536,7 @@ final class IdempotentConsumerIT {
     private String createAccount(final String accountNumber) throws Exception {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().writerToken());
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/accounts",
                 new HttpEntity<>("{\"accountNumber\":\"" + accountNumber + "\",\"currency\":\"EUR\"}", headers),

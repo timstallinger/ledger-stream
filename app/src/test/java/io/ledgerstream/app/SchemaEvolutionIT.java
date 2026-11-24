@@ -6,6 +6,7 @@ import io.ledgerstream.adapter.in.messaging.LedgerEventRecordMapper;
 import io.ledgerstream.adapter.in.messaging.RawPayloadPreservingAvroDeserializer;
 import io.ledgerstream.adapter.out.messaging.KafkaTopicProperties;
 import io.ledgerstream.adapter.out.messaging.avro.LedgerBookingEvent;
+import io.ledgerstream.app.security.TestJwtSupport;
 import io.ledgerstream.application.port.in.IncomingLedgerEvent;
 import io.ledgerstream.application.port.in.RelayOutboxUseCase;
 import io.ledgerstream.application.port.out.AccountSummary;
@@ -123,6 +124,7 @@ final class SchemaEvolutionIT {
     static void schemaRegistryProperties(final DynamicPropertyRegistry registry) {
         registry.add("spring.kafka.producer.properties.schema.registry.url", SchemaEvolutionIT::schemaRegistryUrl);
         registry.add("spring.kafka.consumer.properties.schema.registry.url", SchemaEvolutionIT::schemaRegistryUrl);
+        TestJwtSupport.registerProperties(registry);
     }
 
     @BeforeAll
@@ -319,6 +321,7 @@ final class SchemaEvolutionIT {
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().operatorToken());
         ResponseEntity<String> replayResponse = restTemplate.postForEntity(
                 "/admin/dlq/" + entry.id() + "/replay",
                 new HttpEntity<>("{\"replayedBy\":\"schema-test\",\"note\":\"v2 replay after account created\"}", headers),
@@ -480,6 +483,7 @@ final class SchemaEvolutionIT {
     private String createAccount(final String accountNumber) throws Exception {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().writerToken());
         ResponseEntity<String> response = restTemplate.postForEntity(
                 "/api/v1/accounts",
                 new HttpEntity<>("{\"accountNumber\":\"" + accountNumber + "\",\"currency\":\"EUR\"}", headers),
@@ -499,6 +503,7 @@ final class SchemaEvolutionIT {
     ) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(TestJwtSupport.instance().writerToken());
         headers.set("Idempotency-Key", idempotencyKey);
         String body = """
                 {
