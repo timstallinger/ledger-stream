@@ -100,6 +100,24 @@ ORDER BY attempted_at ASC;
   ```
 - **Doppelte Sicherheit:** Ein zweiter HTTP-Replay auf dieselbe ID liefert `409 Conflict` (`replayed_at`-Guard); selbst bei manuellem Re-Publish auf Kafka verhindert `UNIQUE(event_id)` auf `processed_events` jede Doppelbuchung in `account_summary`.
 
+### 2.6 DLQ-Replay im `prod`-Overlay aktivieren
+
+In [`deploy/kustomize/overlays/prod/kustomization.yaml`](../deploy/kustomize/overlays/prod/kustomization.yaml#L16) ist `LEDGER_ADMIN_ENABLED=false` hart gepinnt (`/admin/**` liefert `404 Not Found` noch vor der OIDC-Prüfung). Für ein kontrolliertes Produktions-Replay gelten vier verbindliche Schritte:
+
+1. **Wartungsfenster öffnen:** In [`deploy/kustomize/overlays/prod/kustomization.yaml`](../deploy/kustomize/overlays/prod/kustomization.yaml#L16) `LEDGER_ADMIN_ENABLED=true` setzen.
+2. **Deklarativ ausrollen:** `git commit` + `git push origin main` → ArgoCD synct selbstständig; warten, bis `argocd app get ledger-stream` wieder **`Synced + Healthy`** meldet.
+3. **Replay als `operator` ausführen:**
+   ```bash
+   curl -fsS -X POST "http://<app-host>:8080/admin/dlq/<dlq-entry-uuid>/replay" \
+     -H "Authorization: Bearer <operator-jwt>" \
+     -H "Content-Type: application/json" \
+     -d '{"note":"Ursache behoben, kontrolliertes Prod-Replay"}'
+   ```
+4. **Wartungsfenster sofort schließen:** `LEDGER_ADMIN_ENABLED=false` zurücksetzen, `git commit` + `git push origin main`, ArgoCD-Sync abwarten und erneut verifizieren, dass `GET /admin/dlq` wieder **`404 Not Found`** (ohne Token und mit `operator`-Token) liefert.
+
+- **Berechtigung & Audit-Trail:** Ausschließlich die Keycloak-Rolle **`operator`** (`ROLE_operator`) darf `/admin/dlq/**` aufrufen (`viewer`/`writer` erhalten `403`). Jeder Versuch wird unveränderlich in `dlq_replay_attempts` (`attempted_at`, `attempted_by` aus dem JWT-Subject, `outcome`, `error_class`, `note`) protokolliert.
+- **Sicherheitshinweis:** Während des geöffneten Wartungsfensters ist `/admin/dlq/**` über das Cluster-Netz erreichbar (abgesichert durch OIDC + `ROLE_operator`); das Fenster ist daher unmittelbar nach Abschluss des Replays wieder zu schließen.
+
 ---
 
 ## 3. Rollback (`git revert` → ArgoCD) & Verhalten laufender Buchungen
@@ -114,9 +132,13 @@ ORDER BY attempted_at ASC;
    ```
 3. **ArgoCD (`automated.selfHeal: true`, `prune: true`)** erkennt den Revert automatisch und rollt das betroffene Deployment auf den vorherigen unveränderlichen `@sha256:`-Digest zurück (`argocd app get ledger-stream --core` → `Synced + Healthy`).
 
+### Grenze von ArgoCD Self-Heal unter `ServerSideApply=true`
+
+Unter `ServerSideApply=true` bleiben zusätzliche, nicht Git-verwaltete Felder (z. B. `kubectl set env deploy/frontend FOO=bar`, Field-Manager `kubectl-set`) erhalten. ArgoCD meldet dabei weiterhin `Synced`, weil der Controller per SSA nur seine eigenen Git-verwalteten Felder abgleicht. Zur vollständigen Bereinigung solcher extern hinzugefügten Felder dient `argocd app sync ledger-stream --force` oder das Umschalten auf `Replace` statt `ServerSideApply`.
+
 ### Was passiert während des Rollbacks mit laufenden Buchungen?
 
-- **Strategie `Recreate` (bei 1-Replica-1,5-GiB-Budget):** Kubernetes sendet `SIGTERM` an den alten `app`-Pod (`terminationGracePeriodSeconds: 30`). Spring Boot fährt den Tomcat-Server graceful herunter (laufende HTTP-Requests innerhalb einer offenen DB-Transaktion committen oder rollen atomar zurück).
+- **Strategie `RollingUpdate` im `prod`-Overlay (`app`) vs. `Recreate` (`local`/übrige Services):** Im `prod`-Overlay fährt `app` `RollingUpdate` (`maxSurge: 25%`, `maxUnavailable: 25%` — bei `replicas: 1` startet Kubernetes erst den neuen `app`-Pod bis `Ready`, bevor der alte `SIGTERM` erhält; Quota-Hard `2000m`/`2304Mi` hält genau diesen einen Surge-Pod vor). In `local` (`Recreate`) wird zuerst `SIGTERM` gesendet (`terminationGracePeriodSeconds: 30`); Spring Boot fährt Tomcat graceful herunter (laufende HTTP-Requests committen oder rollen atomar zurück).
 - **Clients während des kurzen Neustartfensters:** Neue HTTP-Requests erhalten kurzzeitig Verbindungsfehler / `503`. Dank clientseitigem `Idempotency-Key` (im Frontend vor Submit erzeugt und beibehalten) kann jeder Client gefahrlos mit demselben Key wiederholen — wurde die Buchung vor `SIGTERM` bereits committed, liefert die zurückgerollte Version byte-gleich die gecachte Antwort (`201 + Idempotency-Replayed: true`); wurde sie gerollt, wird sie genau einmal neu gebucht.
 - **Outbox & Consumer:** Unversendete `PENDING`-Events verbleiben sicher in PostgreSQL (`outbox_events`) und werden nach Start des alten Pods weiter ausgeliefert. Dank Schema-Kompatibilität **`FULL`** ([ADR-0005](adr/0005-avro-full-compatibility-statt-backward.md)) kann die ältere App-Version auch bereits von der neueren Version geschriebene Avro-Events dekodieren.
 - **Wichtige Grenze:** Flyway-Migrationen sind vorwärtsgerichtet (Expand-Contract-Prinzip). Ein App-Rollback ist nur dann sicher, wenn Datenbank-Migrationen der neueren Version abwärtskompatibel zur vorherigen App-Version geblieben sind (keine destruktiven `DROP COLUMN` im selben Release).

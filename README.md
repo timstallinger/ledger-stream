@@ -52,6 +52,7 @@ flowchart TB
 - **Bewusste Trade-offs & Systemgrenzen:** [docs/design-decisions.md](docs/design-decisions.md)
 - **Betriebs-Runbook (Outbox, DLQ, Rollback, Broker-Ausfall, Skalierung):** [docs/operations.md](docs/operations.md)
 - **Detail-Architektur (Hexagonal & End-to-End-Sequenz):** [docs/architecture.md](docs/architecture.md)
+- **Live-Demo-Skript (9 Schritte + Offline-Fallback):** [docs/demo-script.md](docs/demo-script.md)
 
 ## Schnellstart
 
@@ -75,7 +76,7 @@ npm --prefix frontend ci && npm --prefix frontend run typecheck && npm --prefix 
 | **Backend API & Actuator** | `http://localhost:8080` | REST API (`/api/v1/accounts/**`), Health (`/actuator/health`), Metriken (`/actuator/prometheus`) |
 | **Keycloak 26** | `http://localhost:8180` | Realm `ledger-stream` (Demo-User aus `keycloak/realm-export.json`: `viewer`/`viewer`, `writer`/`writer`, `operator`/`operator`) |
 | **Prometheus** | `http://localhost:9090` | Metrik-Abfragen (Scrape-Targets: `app:8080`, `keycloak:9000`) |
-| **Grafana** | `http://localhost:3001` | Zero-Click-Dashboard `ledger-stream-overview` (`admin` / Env `GRAFANA_ADMIN_PASSWORD`, lokal Default `admin`) |
+| **Grafana** | `http://localhost:3001` | Zero-Click-Dashboard `ledger-stream-overview` (`admin` / Env `GRAFANA_ADMIN_PASSWORD`, lokal Default `change_me_local_grafana`) |
 
 > **Hinweise:** PostgreSQL (`5432`) ist in `docker-compose.yml` bewusst nicht auf den Host gemappt. Alle Integrationstests laufen vollständig isoliert gegen Testcontainers. Der vertrauliche Keycloak-Client `ledger-stream-cli` (`directAccessGrantsEnabled=true`) in [keycloak/realm-export.json](keycloak/realm-export.json) dient ausschließlich als Test- und Lastgenerator-Infrastruktur; produktive Browser-Logins nutzen ausschließlich den Public-PKCE-Client `ledger-stream-spa`.
 
@@ -142,6 +143,8 @@ Jede schreibende Operation (`POST /api/v1/accounts/{id}/bookings`, `POST /api/v1
 | **1,5 vCPU initial** (`app 0.60`, `pg 0.35`, `kf 0.25`, `sr 0.15`, `kc 0.10`, `rest 0.05`) | `106.000` (`100k`/`5k`/`1k`) | `100.000` (`0`) | `5.000` (`0`) | `0` | `1.000` (`0`) | `899` | `998,03 s` | `278,64 s` (`1276,67 s`) | `100,2 /s` (`105,2` HTTP/s) | `254,2 /s` (`5m`) | `1662,00 MiB` (`+126,00` über 1536) | **PASS** (`EXIT 0`, 10/10 Konten) |
 | **1,5 vCPU rebalanced (F1)** (`app 0.50`, `kc 0.30` `-Xmx224m`, `pg 0.35`, `kf 0.20`, `sr 0.10`, `rest 0.05`) | `106.000` (`100k`/`5k`/`1k`) | `100.000` (`0`) | `5.000` (`0`) | `0` | `1.000` (`0`) | `1.320` | `1178,78 s` | `280,56 s` (`1459,34 s`) | `84,8 /s` (`89,1` HTTP/s) | `249,8 /s` (`5m`) | **`1637,44 MiB`** (`+101,44` über 1536) | **PASS** (`EXIT 0`, 10/10 Konten) |
 
+> **Outbox-Entkopplung im Lastprofil:** Unconstrained ist der Schreibpfad 1,6x schneller als die Projektion (1064,2 Buch./s vs. 659,2 Events/s). Die Outbox puffert die Differenz — max(outbox_unsent) = 8.549 — und drainiert sie in 103,35 s. Unter 1,5 vCPU kehrt sich der Engpass um: die API ist auf 84,8 Buch./s gedrosselt, die Projektion kommt mit 249,8 Events/s hinterher (max 1.320). Der Rückstand ist kein Defekt, sondern der Nachweis, dass Annahme und Verarbeitung entkoppelt sind: die Differenz wird sichtbar statt zum Datenverlust.
+
 ### Latenzvergleich: Client (`load-generator`) vs. Server (Prometheus `http_server_requests_seconds`)
 
 | Profil | Messpunkt | p50 | p95 | p99 |
@@ -157,7 +160,11 @@ Jede schreibende Operation (`POST /api/v1/accounts/{id}/bookings`, `POST /api/v1
 
 ## Ressourcenbudget & Speicher-Aufteilung (F1, F2, F3)
 
-> **Ehrliche Budget-Korrektur (F1/F2):** Die ursprüngliche Zielvorgabe (`1,5 GiB` RAM + `1,5 vCPU` für alle 8 Container) wird im **Unconstrained**-Lauf beim RAM gehalten (`anon = 1515,87 MiB`, `+20,13 MiB` Luft zu `1536 MiB`), nicht aber bei der CPU. Unter harter **`1,5 vCPU`**-Drosselung senkt die Umverteilung auf `keycloak 0.30 vCPU` + `-Xmx224m` (F1) den Keycloak-Working-Set um `35,05 MiB` (von `508,87` auf `473,82 MiB`), doch die reale Summe aller 8 Container unter `1,5 vCPU` bleibt bei **`1637,44 MiB` `anon`** (`+101,44 MiB` über `1536 MiB`; Kern-6 ohne Prometheus/Grafana: `1544,14 MiB`). Statt beide Kriterien gleichzeitig zu behaupten, korrigieren wir das k3s-Budget ehrlich auf **`1792Mi` (`1,75 GiB`) `requests.memory`** (`1728Mi` belegt) und exakt **`1500m` (`1,50 vCPU`) `requests.cpu`** ([`resource-quota.yaml`](deploy/kustomize/base/resource-quota.yaml), [ADR-0009](docs/adr/0009-ressourcenbudget-als-designzwang.md)).
+> **Ehrliche Budget-Korrektur (F1/F2):** Die ursprüngliche Zielvorgabe (`1,5 GiB` RAM + `1,5 vCPU` für alle 8 Container) wird im **Unconstrained**-Lauf beim RAM gehalten (`anon = 1515,87 MiB`, `+20,13 MiB` Luft zu `1536 MiB`), nicht aber bei der CPU. Unter harter **`1,5 vCPU`**-Drosselung senkt die Umverteilung auf `keycloak 0.30 vCPU` + `-Xmx224m` (F1) den Keycloak-Working-Set um `35,05 MiB` (von `508,87` auf `473,82 MiB`), doch die reale Summe aller 8 Container unter `1,5 vCPU` bleibt bei **`1637,44 MiB` `anon`** (`+101,44 MiB` über `1536 MiB`; Kern-6 ohne Prometheus/Grafana: `1544,14 MiB`).
+>
+> **Aufschlüsselung mit vs. ohne IdP:** Kern-Stack (App, PostgreSQL, Kafka, Schema Registry, Frontend, Monitoring): 1163,62 MiB anon. Keycloak als externer IdP: weitere 473,82 MiB — 28,9 % des Gesamtverbrauchs für eine Komponente, die im Request-Pfad nur Token validiert. Gesamt: 1,75 GiB mit IdP, 1,14 GiB ohne.
+>
+> Das nominale Pod-Budget liegt damit ehrlich bei **`1728Mi` (`~1,75 GiB`) `requests.memory`** und exakt **`1500m` (`1,50 vCPU`) `requests.cpu`** ([`resource-quota.yaml`](deploy/kustomize/base/resource-quota.yaml), [ADR-0009](docs/adr/0009-ressourcenbudget-als-designzwang.md)).
 
 ### Cgroup-v2-Speicheraufteilung im 100k-Peak (F1 rebalanced `1,5 vCPU`, `/sys/fs/cgroup/memory.stat`)
 
@@ -173,12 +180,18 @@ Jede Zeile erfüllt exakt `anon + file + Kernel/Rest == memory.current` (F3):
 | `frontend` | `24Mi` / `20m` | `48Mi` / `100m` | `22,92 MiB` | `13,72 MiB` | `2,63 MiB` | `3,20` (`1,22`) | `6,57 MiB` |
 | `prometheus` | `32Mi` / `15m` | `192Mi` / `150m` | `29,27 MiB` | `26,10 MiB` | `1,28 MiB` | `1,22` (`0,48`) | `1,89 MiB` |
 | `grafana` | `72Mi` / `15m` | `192Mi` / `150m` | `73,48 MiB` | `67,20 MiB` | `1,18 MiB` | `4,41` (`3,04`) | `5,10 MiB` |
-| **Summe (8 Container)** | **`1728Mi` / `1500m`** *(Quota: `1792Mi` / `1500m`)* | **`2864Mi` / `3150m`** *(Quota: `2944Mi` / `4000m`)* | **`2060,54 MiB`** | **`1637,44 MiB`** | **`350,21 MiB`** | **`49,94` (`27,09`)** | **`72,89 MiB`** |
+| **Summe (8 Container)** | **`1728Mi` / `1500m`** *(Quota-Hard: `2304Mi` / `2000m` inkl. Surge)* | **`2864Mi` / `3150m`** *(Quota-Hard: `3584Mi` / `5000m` inkl. Surge)* | **`2060,54 MiB`** | **`1637,44 MiB`** | **`350,21 MiB`** | **`49,94` (`27,09`)** | **`72,89 MiB`** |
 
 - **Summenprobe (F3):** `1637,44 (anon) + 350,21 (file) + 72,89 (Kernel+Rest) = 2060,54 MiB == memory.current (2060,54 MiB)` (exakte Differenz `0,00 MiB`). Die Lücke zwischen `memory.current` und `anon + file` besteht aus Kernel-Strukturen (`kernel = 49,94 MiB`, darunter `slab = 27,09 MiB` für Dentry/Inode/Page-Tables), `sock`/`shmem` und cgroup-Accounting-Overhead.
 - **App-Non-Heap-Diagnose (`jcmd 1 VM.native_memory summary` im 100k-Peak):** `committed = 509,8 MiB` — Direct Buffers (`Other`) sind mit **`12,8 MiB` unauffällig** (kein Direct-Buffer-Leak). Der reale Non-Heap (`~220–255 MiB`) besteht aus Metaspace/Class/Shared (`98,2 MiB`, `17.952` Klassen), G1GC-Strukturen (`51,5 MiB`), CodeCache (`45,3 MiB`), Symbol-Tabelle (`25,9 MiB`), `178` Threads (`18,3 MiB`) und C2-Compiler-Spitzen (`~55 MiB`). Daher ist `512 MiB` das knappe Demo-Limit in Compose und `640 MiB` das Produktions-Limit in k3s.
-- **Limit-Overcommit `1,66×` erklärt (F2):** `requests.memory` (`1728Mi` Summe, je Pod ≥ gemessenem `anon`-Peak) ist die harte Scheduler-Reservierung in Kubernetes (`ResourceQuota`: `1792Mi`). `limits.memory` (`2864Mi` Summe = `1,66×` der Requests) sind **keine** Reservierungen, sondern Obergrenzen je Container für reclaimbaren Linux-Page-Cache (`postgres 236 MiB`, `kafka 86 MiB`) und nicht-gleichzeitige JVM-Bursts, um unnötige OOMKills zu vermeiden.
+- **Limit-Overcommit `1,66×` erklärt (F2):** `requests.memory` (`1728Mi` Summe, je Pod ≥ gemessenem `anon`-Peak) ist die harte Scheduler-Reservierung in Kubernetes. `limits.memory` (`2864Mi` Summe = `1,66×` der Requests) sind **keine** Reservierungen, sondern Obergrenzen je Container für reclaimbaren Linux-Page-Cache (`postgres 236 MiB`, `kafka 86 MiB`) und nicht-gleichzeitige JVM-Bursts, um unnötige OOMKills zu vermeiden.
 - **Verifizierte PostgreSQL-Parameter (`SHOW`):** `shared_buffers = 64MB`, `work_mem = 4MB`, `maintenance_work_mem = 32MB`, `lock_timeout = 3s` ([`docker-compose.yml`](docker-compose.yml)).
+
+### Deploy-Strategie und ResourceQuota
+
+- **Basis-Strategie `Recreate` (`base/` und `overlays/local/`):** Alle Deployments in [`deploy/kustomize/base/`](deploy/kustomize/base/) definieren `strategy: type: Recreate`. Begründung: Die `requests` aller 8 Pods summieren sich auf exakt **`1500m` CPU / `1728Mi` RAM** — im reinen Nominalbudget ist kein Platz für einen parallelen Surge-Pod. `Recreate` kostet bei einem Rollout kurzzeitig Verfügbarkeit, verhindert aber zuverlässig `exceeded quota`-Blockaden.
+- **Unterscheidung Budget vs. Quota-Hard:** Die Summe der Pod-`requests` ist das reale **Budget (`1500m` / `1728Mi`)**. Die Hard-Werte in [`resource-quota.yaml`](deploy/kustomize/base/resource-quota.yaml) bilden **Budget + Surge-Headroom für einen `app`-Pod (`2000m` / `2304Mi`, Limits `5000m` / `3584Mi`)** ab. **Quota-Hard ist kein zweites Budget**, sondern ausschließlich der temporäre Spielraum für einen zweiten `app`-Pod während eines Rolling Updates (`1500m + 500m = 2000m`, `1728Mi + 512Mi = 2240Mi <= 2304Mi`).
+- **Delta im `prod`-Overlay (`RollingUpdate` für `app`):** Das Produktions-Overlay ([`deploy/kustomize/overlays/prod/app-rolling-update-patch.yaml`](deploy/kustomize/overlays/prod/app-rolling-update-patch.yaml)) überschreibt ausschließlich das `app`-Deployment auf `strategy: RollingUpdate` mit `maxSurge: 25%` / `maxUnavailable: 25%` (bei `replicas: 1` startet Kubernetes zuerst den neuen `app`-Pod bis `Ready`, bevor der alte terminiert). Das lokale Overlay ([`overlays/local/`](deploy/kustomize/overlays/local/kustomization.yaml)) bleibt bewusst bei `Recreate`.
 
 ## Deployment & Supply Chain (k3s, Kustomize, ArgoCD, GHCR + Cosign/SBOM)
 
