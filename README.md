@@ -132,24 +132,29 @@ lock_timeout         = 3s
 ## Observability (Micrometer, Prometheus, Grafana, JSON-Logging & Correlation-ID)
 
 - **Micrometer-Metriken (`/actuator/prometheus`, strikt begrenzte Kardinalität):** Ausschließlich geschlossene Label-Mengen (`outcome`, `reason`, `type`, `result`) — **niemals** `accountId`, `eventId`, `correlationId` oder Beträge als Metrik-Tag. Exponiert u. a. `outbox_unsent`, `outbox_oldest_pending_age_seconds`, `outbox_events_failed_total`, `outbox_events_relayed_total{type,result}`, `consumer_processed_total{outcome}`, `consumer_duplicates_rejected_total{reason}`, `consumer_retries_total`, `dlq_entries_unhandled`, `dlq_replayed_total`, `http_server_requests_seconds` (inkl. Histogram-Buckets).
-- **Prometheus & Grafana (Zero-Click-Provisioning):** [observability/prometheus.yml](observability/prometheus.yml) scrapt `app:8080/actuator/prometheus` und `keycloak:9000/metrics` mit `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression`. [observability/grafana/provisioning/datasources/prometheus.yml](observability/grafana/provisioning/datasources/prometheus.yml) provisioniert die Datasource mit fester `uid: prometheus`; [observability/grafana/dashboards/ledger-stream.json](observability/grafana/dashboards/ledger-stream.json) (`uid: ledger-stream-overview`, 7 Panels inkl. roter 300s-Schwelle auf `outbox_oldest_pending_age_seconds`) referenziert diese UID ohne `__inputs`.
+- **Prometheus & Grafana (Zero-Click-Provisioning):** [observability/prometheus.yml](observability/prometheus.yml) scrapt `app:8080/actuator/prometheus` und `keycloak:9000/metrics` mit `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression`. [observability/grafana/provisioning/datasources/prometheus.yml](observability/grafana/provisioning/datasources/prometheus.yml) provisioniert die Datasource mit fester `uid: prometheus`; [observability/grafana/dashboards/ledger-stream.json](observability/grafana/dashboards/ledger-stream.json) (`uid: ledger-stream-overview`, 8 Panels inkl. roter 300s-Schwelle auf `outbox_oldest_pending_age_seconds` sowie separater HTTP-**p95**- und **p99**-Panels mit `uri!~"/actuator.*"` und `sum by (le, uri)`) referenziert diese UID ohne `__inputs`.
 - **Strukturiertes JSON-Logging & 3-stufige Correlation-ID:** [logback-spring.xml](app/src/main/resources/logback-spring.xml) (`logstash-logback-encoder`) schreibt flaches JSON (`ts`, `level`, `logger`, `message`, `correlationId`, `eventId` nur im Event-Kontext; keine Tokens, `Authorization`-Header oder Roh-Payloads). `CorrelationIdFilter` validiert eingehende `X-Correlation-Id` strikt gegen `^[A-Za-z0-9._-]{8,64}$` (ungültige Werte werden verworfen, mit neuer UUID ersetzt und `correlationIdRejected=true` geloggt), persistiert sie in `outbox_events.correlation_id`, überträgt sie per Kafka-Header in den Consumer (`MDC` + `finally MDC.clear()`) und erhält sie beim DLQ-Replay.
 
-## Ressourcenbudget (gemessene `docker stats` nach Phase 9 — ALLE 8 Container)
+## Ressourcenbudget (gemessene `docker stats` — Leerlauf & 100k-Peak, ALLE 8 Container)
 
-Keycloak 26 läuft mit `start --optimized --import-realm`, `-Xmx256m`, `KC_CACHE=local` auf der **bestehenden** PostgreSQL-16-Instanz (eigene Datenbank `keycloak`, kein H2, kein Dev-Mode). Nach dem Lastlauf in Phase 10 wird Keycloak erneut vermessen (`RSS > 450 MiB` → `-Xmx320m`).
+Keycloak 26 läuft mit `start --optimized --import-realm`, `-Xmx256m`, `KC_CACHE=local` auf der **bestehenden** PostgreSQL-16-Instanz (eigene Datenbank `keycloak`, kein H2, kein Dev-Mode). Gemäß L1 wurde `ledger-stream-app` vor dem 100k-Lastlauf auf `512 MiB` (`-XX:MaxRAMPercentage=60.0` ≈ `307 MiB` Heap + Non-Heap-Reserve) angehoben und der **Peak-RSS während des 100.000-Buchungen-Lastlaufs** (2s-Sampling über `docker stats`) gegen den Leerlauf gemessen:
 
-| Container | Limit | Tuning | Gemessener RSS | Auslastung |
-|---|---:|---|---:|---:|
-| `ledger-stream-postgres` | `320 MiB` | `shared_buffers=64MB`, `work_mem=4MB`, `lock_timeout=3s` (DBs: `ledger` + `keycloak`) | `31,21 MiB` | `9,75 %` |
-| `ledger-stream-kafka` | `448 MiB` | KRaft, `-Xms128m -Xmx192m`, `dedupe_buffer=16MB` | `217,50 MiB` | `48,56 %` |
-| `ledger-stream-schema-registry` | `384 MiB` | `FULL`, `-Xmx192m -XX:MaxMetaspaceSize=96m` | `209,00 MiB` | `54,43 %` |
-| `ledger-stream-keycloak` | `640 MiB` | `start --optimized`, `KC_DB=postgres`, `KC_CACHE=local`, `KC_METRICS_ENABLED=true`, `-Xms128m -Xmx256m` | `331,20 MiB` | `51,75 %` |
-| `ledger-stream-app` | `384 MiB` | Java 21 JRE, `-XX:MaxRAMPercentage=65.0 -XX:+UseG1GC` | `232,20 MiB` | `60,46 %` |
-| `ledger-stream-frontend` | `48 MiB` | `nginxinc/nginx-unprivileged:1.27-alpine` (statisches Vue-Bundle) | `16,73 MiB` | `34,85 %` |
-| `ledger-stream-prometheus` | `192 MiB` | `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression` | `21,19 MiB` | `11,04 %` |
-| `ledger-stream-grafana` | `192 MiB` | `GF_INSTALL_PLUGINS=""`, `GF_ANALYTICS_CHECK_FOR_UPDATES=false` | `71,52 MiB` | `37,25 %` |
-| **Summe gemessen (alle 8 Container)** | — | **Zielbudget Gesamtstack: `1536 MiB` (1,5 GiB)** | **`1130,55 MiB`** | **Puffer: `405,45 MiB`** |
+| Container | Limit | Tuning | RSS Leerlauf | RSS Peak (100k-Lauf #1) | Peak-Auslastung |
+|---|---:|---|---:|---:|---:|
+| `ledger-stream-postgres` | `320 MiB` | `shared_buffers=64MB`, `work_mem=4MB`, `max_connections=60`, `lock_timeout=3s` (`ledger` + `keycloak`) | `55,13 MiB` | `260,30 MiB` | `81,36 %` |
+| `ledger-stream-kafka` | `448 MiB` | KRaft, 6 Partitionen, `-Xms128m -Xmx192m`, `dedupe_buffer=16MB` | `213,50 MiB` | `294,40 MiB` | `65,72 %` |
+| `ledger-stream-schema-registry` | `384 MiB` | `FULL`, `-Xmx192m -XX:MaxMetaspaceSize=96m` | `198,70 MiB` | `222,20 MiB` | `57,86 %` |
+| `ledger-stream-keycloak` | `640 MiB` | `start --optimized`, `KC_DB=postgres`, `KC_CACHE=local`, `KC_METRICS_ENABLED=true`, `-Xms128m -Xmx256m` | `400,00 MiB` | `416,60 MiB` | `65,09 %` |
+| `ledger-stream-app` | `512 MiB` | Java 21 JRE, `-XX:MaxRAMPercentage=60.0 -XX:+UseG1GC`, Consumer-Concurrency `6`, Relay `500/200ms` | `272,10 MiB` | `488,40 MiB` | `95,39 %` |
+| `ledger-stream-frontend` | `48 MiB` | `nginxinc/nginx-unprivileged:1.27-alpine` (statisches Vue-Bundle) | `16,29 MiB` | `19,00 MiB` | `39,58 %` |
+| `ledger-stream-prometheus` | `192 MiB` | `--storage.tsdb.retention.time=2d --storage.tsdb.wal-compression` | `21,68 MiB` | `24,57 MiB` | `12,80 %` |
+| `ledger-stream-grafana` | `192 MiB` | `GF_INSTALL_PLUGINS=""`, `GF_ANALYTICS_CHECK_FOR_UPDATES=false` | `69,55 MiB` | `77,31 MiB` | `40,26 %` |
+| **Summe gemessen (alle 8 Container)** | — | **Zielbudget Leerlauf: `1536 MiB` (1,5 GiB)** | **`1246,95 MiB`** *(Puffer `+289,05 MiB`)* | **`1802,78 MiB`** *(Peak-Burst `+266,78 MiB` über 1,5 GiB)* | **0 OOMKills** |
+
+> **Befund aus der Lastmessung:**
+> - **Keycloak (P1):** Peak `416,60 MiB` (`< 450 MiB`) → `-Xmx256m` bleibt ausreichend.
+> - **App (L1):** Kein OOMKill über 2 × 100.000 Buchungen (`Peak 488,40 MiB / 512 MiB` in Lauf #1, `469,80 MiB / 512 MiB` in Lauf #2). Da `95,39 %` im Dauer-Burst knapp am Container-Limit liegen, wird im k3s-Produktions-Overlay (Phase 11) `limits.memory: 640Mi` eingeplant.
+> - **Summe im 100k-Burst:** Der Anstieg von `1246,95 MiB` (Leerlauf) auf `1802,78 MiB` (Peak) resultiert aus PostgreSQL-Page-Cache/WAL (`+205 MiB`), App-Heap/Netty/Kafka-Puffern (`+216 MiB`) und Kafka-Page-Cache (`+81 MiB`). Beide Werte werden getrennt ausgewiesen.
 
 ## Schema-Evolution (Avro + Confluent Schema Registry)
 
@@ -169,14 +174,41 @@ docker compose up -d --wait
 
 > Hinweis: PostgreSQL in `docker-compose.yml` ist standardmäßig nur innerhalb des Compose-Netzwerks erreichbar (kein Host-Port-Mapping). Alle Integrationstests laufen vollständig isoliert über Testcontainers.
 
-## Lastnachweis (Phase 10)
+## Lastnachweis (Phase 10 — 100.000 Buchungen, reproduzierbar)
 
-> Die folgenden Messwerte werden in Phase 10 reproduzierbar mit festem Seed erhoben.
->
 > **Klare Trennung der Nachweise:**
-> - **Retry-Leiter (5 Versuche, exponentieller Backoff + Jitter):** nachgewiesen über dedizierten Integrationstest (Phase 5), nicht über den Lasttest.
-> - **DLQ-Anteil im Lasttest (1 %):** transportseitige Fault Injection (schema-valide Poison-Events mit unbekanntem Konto und `amount <= 0` direkt ins Topic durch `load-generator`), kein Test-Schalter im Produktivcode.
+> - **Retry-Leiter (5 Versuche, exponentieller Backoff + Jitter):** nachgewiesen über dedizierten Integrationstest (`DlqAndRetryIT`, Phase 5), nicht über den Lasttest.
+> - **Duplikat-Kohorte (5 %, L2):** echte Replays bereits akzeptierter Anfragen aus einem Ringpuffer (`Idempotency-Key` + identischer Payload → `201 Created` + `Idempotency-Replayed: true`, byte-identischer Body, keine zweite Buchung, kein zweites Kafka-Event → `consumer_duplicates_rejected_total{reason="duplicate"} == 0`). Consumer-seitige Duplikat-Abweisung (`UNIQUE(event_id)`) ist separat in `IdempotentConsumerIT` nachgewiesen.
+> - **DLQ-Anteil im Lasttest (1 %):** transportseitige Fault Injection (schema-valide Avro-v2-Poison-Events — 50 % `unknown_account`, 50 % `non_positive_amount` — direkt ins Topic `ledger.events` durch `load-generator`), kein Test-Schalter im Produktivcode.
+> - **Aufwärmphase:** erste `5 s` gegen dedizierte Warmup-Konten, vollständig aus Durchsatz- und Latenzwerten ausgeschlossen (in der Gesamt-DB-Invariante jedoch exakt gegen `bookings` und `processed_events` mitgeprüft).
 
-| Gesendet | Akzeptiert | Validierung abgelehnt | Duplikate abgewiesen | DLQ-Einträge | Dauer | Durchsatz | Seed |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| _Phase 10_ | _Phase 10_ | _Phase 10_ | _Phase 10_ | _Phase 10_ | _Phase 10_ | _Phase 10_ | _Phase 10_ |
+### Umgebung & Reproduzierbarkeits-Parameter (L6)
+
+| Parameter | Wert |
+|---|---|
+| **Host-Hardware** | Intel Core Ultra 7 155H (`22` vCPU / 11 Kerne × 2 Threads), `31 GiB` RAM, `1 TB` virtuelle Disk (`/dev/sdd`), virtualisiert (`WSL2` / Microsoft Hypervisor) |
+| **Container-Konfiguration** | `docker-compose.yml` + `docker-compose.loadtest.yml` (identische `mem_limit`-Werte wie oben; CPU-Caps für den Lastlauf entdrosselt: `app: 6.0`, `postgres: 4.0`, `kafka: 2.0`, `keycloak: 2.0`, `schema-registry: 1.0`) |
+| **JVM (App-Container)** | `eclipse-temurin:21-jre-alpine`, `JAVA_OPTS="-XX:MaxRAMPercentage=60.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"` (`512 MiB` Limit → `~307 MiB` Heap) |
+| **JVM (Client `load-generator`)** | `OpenJDK 25.0.2 LTS (Corretto-25.0.2.10.1)` (kompiliert mit `--release 21`), `-Djdk.httpclient.keepalive.timeout=60` |
+| **Kafka-Partitionen & Consumer (L3a)** | `ledger.events`: **6 Partitionen**, `ledger.events.dlq`: **6 Partitionen**, Consumer-Concurrency: **`6`** (`KAFKA_CONSUMER_CONCURRENCY=6`) |
+| **Outbox-Relay-Deckel (L3b)** | Batch `500`, Poll-Intervall `200 ms` (`OUTBOX_RELAY_FIXED_DELAY_MS=200`, theoretischer Deckel `2.500 Events/s`; Wave-basiertes Kafka-Pipelining je distinktem Konto) |
+| **Client-Setup (L3c)** | `load-generator` CLI (ohne Spring-Kontext), `--threads=32`, `128` vorangelegte Benchmark-Konten, HTTP/1.1 Keep-Alive Connection-Pool |
+| **Aufruf (reproduzierbar)** | `java -Djdk.httpclient.keepalive.timeout=60 -jar load-generator/target/load-generator-0.1.0-SNAPSHOT-shaded.jar --bookings=100000 --duplicates=0.05 --poison=0.01 --seed=20261124 --threads=32 --warmup-seconds=5 --base-url=http://127.0.0.1:8085` |
+
+### Ergebnisse (zwei unabhängige Läufe mit identischem Seed `20261124`)
+
+| Lauf | Gesendet (Regulär / Dup / Poison) | Akzeptiert (DB-Diff) | Validierung abgelehnt | L2-Duplikate replayed (`201` + Header) | Consumer-Duplikate (`reason="duplicate"`) | DLQ-Einträge (Diff) | Dauer (ohne 5s Warmup) | Durchsatz HTTP (akzept. Buchungen/s) | Durchsatz Consumer (Prometheus 2m-Peak) | Invarianten-Check | Seed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| **Lauf #1** | `106.000` (`100.000` / `5.000` / `1.000`) | `100.000` *(Diff `0`)* | `0` | `5.000` *(0 Mismatch)* | `0` | `1.000` *(Diff `0`)* | `211,26 s` | `473,3 /s` *(497,0 HTTP/s)* | `417,3 Events/s` *(6 Part., Conc. 6)* | **PASS** (`EXIT 0`, 10/10 Konten exakt) | `20261124` |
+| **Lauf #2** | `106.000` (`100.000` / `5.000` / `1.000`) | `100.000` *(Diff `0`)* | `0` | `5.000` *(0 Mismatch)* | `0` | `1.000` *(Diff `0`)* | `199,55 s` | `501,1 /s` *(526,2 HTTP/s)* | `466,9 Events/s` *(6 Part., Conc. 6)* | **PASS** (`EXIT 0`, 10/10 Konten exakt) | `20261124` |
+
+### Latenzvergleich: Clientseitig (`load-generator`) vs. Serverseitig (Prometheus `http_server_requests_seconds`)
+
+| Lauf | Messpunkt | p50 | p95 | p99 |
+|---|---|---:|---:|---:|
+| **Lauf #1** | **Client** (`load-generator`, regulär / alle HTTP) | `56,39 ms` / `55,30 ms` | `128,60 ms` / `127,32 ms` | `183,24 ms` / `181,89 ms` |
+| **Lauf #1** | **Server** (Prometheus `POST /api/v1/accounts/{accountId}/bookings`, `5m`-Fenster) | `37,57 ms` | `87,87 ms` | `131,23 ms` |
+| **Lauf #2** | **Client** (`load-generator`, regulär / alle HTTP) | `51,11 ms` / `50,09 ms` | `131,30 ms` / `130,02 ms` | `191,57 ms` / `190,02 ms` |
+| **Lauf #2** | **Server** (Prometheus `POST /api/v1/accounts/{accountId}/bookings`, `5m`-Fenster) | `35,02 ms` | `87,77 ms` | `136,47 ms` |
+
+> **Determinismus-Nachweis (Seed `20261124`):** Beide Läufe auf frisch zurückgesetzten Stacks liefern exakt identische Kohortenzahlen (`100.000` / `5.000` / `1.000`), exakt `0` Abweichung auf allen 5 Invarianten sowie centgenau identische Endsalden auf allen 10 Stichprobenkonten (z. B. `DE-BENCH-1352904-0000 = 11737.39 EUR`, `DE-BENCH-1352904-0001 = 12307.11 EUR`, …, `DE-BENCH-1352904-0009 = 12112.79 EUR`, je `782/782` Buchungen).
