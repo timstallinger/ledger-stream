@@ -43,6 +43,25 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: seed-kafka-config
+          image: apache/kafka:3.9.1
+          command: ["sh", "-c", "cp -a /opt/kafka/config/. /writable-config/"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 25m
+            limits:
+              memory: 64Mi
+              cpu: 100m
+          volumeMounts:
+            - name: kafka-config
+              mountPath: /writable-config
       containers:
         - name: kafka
           image: apache/kafka:3.9.1
@@ -128,6 +147,8 @@ spec:
               mountPath: /tmp
             - name: shared-config
               mountPath: /mnt/shared/config
+            - name: kafka-config
+              mountPath: /opt/kafka/config
             - name: kafka-logs
               mountPath: /opt/kafka/logs
       volumes:
@@ -136,6 +157,8 @@ spec:
         - name: tmp
           emptyDir: {}
         - name: shared-config
+          emptyDir: {}
+        - name: kafka-config
           emptyDir: {}
         - name: kafka-logs
           emptyDir: {}
