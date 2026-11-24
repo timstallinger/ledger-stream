@@ -5,6 +5,7 @@ import io.ledgerstream.application.port.in.ReplayDlqCommand;
 import io.ledgerstream.application.port.in.ReplayDlqUseCase;
 import io.ledgerstream.application.port.out.DlqEntry;
 import io.ledgerstream.application.port.out.DlqObserver;
+import io.ledgerstream.application.port.out.DlqReplayAttempt;
 import io.ledgerstream.application.port.out.DlqRepository;
 import io.ledgerstream.application.port.out.RawEventPublisher;
 import io.ledgerstream.application.port.out.TransactionRunner;
@@ -17,11 +18,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 
 public final class DlqReplayService implements ReplayDlqUseCase, ListDlqUseCase {
 
     private static final String HEADER_REPLAYED_FROM = "x-dlq-replayed-from";
     private static final String HEADER_CORRELATION_ID = "X-Correlation-Id";
+    private static final String OUTCOME_DISPATCHED = "DISPATCHED";
+    private static final String OUTCOME_FAILED = "FAILED";
 
     private final DlqRepository dlqRepository;
     private final RawEventPublisher rawEventPublisher;
@@ -47,34 +51,61 @@ public final class DlqReplayService implements ReplayDlqUseCase, ListDlqUseCase 
     public DlqEntry replay(final ReplayDlqCommand command) {
         Objects.requireNonNull(command, "command must not be null");
 
-        DlqEntry replayed = transactionRunner.executeInTransaction(() -> {
-            DlqEntry existing = dlqRepository.findById(command.dlqEntryId())
-                    .orElseThrow(() -> new DlqEntryNotFoundException(command.dlqEntryId()));
-            if (existing.replayedAt() != null) {
-                throw new DlqEntryAlreadyReplayedException(command.dlqEntryId());
-            }
+        DlqEntry replayed;
+        try {
+            replayed = transactionRunner.executeInTransaction(() -> {
+                DlqEntry existing = dlqRepository.findById(command.dlqEntryId())
+                        .orElseThrow(() -> new DlqEntryNotFoundException(command.dlqEntryId()));
+                if (existing.replayedAt() != null) {
+                    throw new DlqEntryAlreadyReplayedException(command.dlqEntryId());
+                }
 
-            Instant now = clock.instant();
-            boolean transitioned = dlqRepository.markReplayed(
-                    existing.id(),
-                    now,
+                Instant now = clock.instant();
+                boolean transitioned = dlqRepository.markReplayed(
+                        existing.id(),
+                        now,
+                        command.replayedBy()
+                );
+                if (!transitioned) {
+                    throw new DlqEntryAlreadyReplayedException(command.dlqEntryId());
+                }
+
+                Map<String, String> replayHeaders = new LinkedHashMap<>();
+                replayHeaders.put(HEADER_REPLAYED_FROM, existing.id().toString());
+                String correlationId = existing.headers().get("correlationId");
+                if (correlationId != null && !correlationId.isBlank()) {
+                    replayHeaders.put(HEADER_CORRELATION_ID, correlationId);
+                }
+
+                rawEventPublisher.publishRaw(existing.topic(), existing.recordKey(), existing.payload(), replayHeaders);
+
+                dlqRepository.recordReplayAttempt(new DlqReplayAttempt(
+                        UUID.randomUUID(),
+                        existing.id(),
+                        now,
+                        command.replayedBy(),
+                        OUTCOME_DISPATCHED,
+                        null,
+                        command.note()
+                ));
+
+                return existing.withReplayState(now, command.replayedBy());
+            });
+        } catch (DlqEntryNotFoundException | DlqEntryAlreadyReplayedException domainException) {
+            throw domainException;
+        } catch (RuntimeException publishFailure) {
+            Instant failedAt = clock.instant();
+            transactionRunner.runInTransaction(() -> dlqRepository.recordReplayAttempt(new DlqReplayAttempt(
+                    UUID.randomUUID(),
+                    command.dlqEntryId(),
+                    failedAt,
                     command.replayedBy(),
+                    OUTCOME_FAILED,
+                    publishFailure.getClass().getName(),
                     command.note()
-            );
-            if (!transitioned) {
-                throw new DlqEntryAlreadyReplayedException(command.dlqEntryId());
-            }
-
-            Map<String, String> replayHeaders = new LinkedHashMap<>();
-            replayHeaders.put(HEADER_REPLAYED_FROM, existing.id().toString());
-            String correlationId = existing.headers().get("correlationId");
-            if (correlationId != null && !correlationId.isBlank()) {
-                replayHeaders.put(HEADER_CORRELATION_ID, correlationId);
-            }
-
-            rawEventPublisher.publishRaw(existing.topic(), existing.recordKey(), existing.payload(), replayHeaders);
-            return existing.withReplayMetadata(now, command.replayedBy(), command.note());
-        });
+            )));
+            throw publishFailure;
+        }
 
         dlqObserver.onDlqReplayed(replayed.id(), replayed.topic(), replayed.recordKey());
         return replayed;

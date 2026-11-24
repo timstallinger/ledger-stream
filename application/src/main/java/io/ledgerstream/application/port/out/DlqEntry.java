@@ -23,8 +23,7 @@ public final class DlqEntry {
     private final Map<String, String> headers;
     private final Instant createdAt;
     private final Instant replayedAt;
-    private final String replayedBy;
-    private final String note;
+    private final String lastReplayedBy;
 
     public DlqEntry(
             final UUID id,
@@ -40,8 +39,7 @@ public final class DlqEntry {
             final Map<String, String> headers,
             final Instant createdAt,
             final Instant replayedAt,
-            final String replayedBy,
-            final String note
+            final String lastReplayedBy
     ) {
         this.id = Objects.requireNonNull(id, "id must not be null");
         this.topic = Objects.requireNonNull(topic, "topic must not be null");
@@ -58,8 +56,7 @@ public final class DlqEntry {
                 : Map.of();
         this.createdAt = Objects.requireNonNull(createdAt, "createdAt must not be null");
         this.replayedAt = replayedAt;
-        this.replayedBy = replayedBy;
-        this.note = note;
+        this.lastReplayedBy = lastReplayedBy;
     }
 
     public UUID id() {
@@ -114,19 +111,15 @@ public final class DlqEntry {
         return replayedAt;
     }
 
-    public String replayedBy() {
-        return replayedBy;
+    public String lastReplayedBy() {
+        return lastReplayedBy;
     }
 
-    public String note() {
-        return note;
-    }
-
-    public DlqEntry withReplayMetadata(final Instant replayedAtValue, final String replayedByValue, final String noteValue) {
+    public DlqEntry withReplayState(final Instant replayedAtValue, final String lastReplayedByValue) {
         return new DlqEntry(
                 id, topic, partition, offset, recordKey, eventId,
                 errorClass, errorMessage, attemptCount, payload, headers,
-                createdAt, replayedAtValue, replayedByValue, noteValue
+                createdAt, replayedAtValue, lastReplayedByValue
         );
     }
 }

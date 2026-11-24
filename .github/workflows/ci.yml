@@ -45,6 +45,8 @@ jobs:
           fi
 
       - name: Verify Schema Evolution & Compatibility Check IT executed
+        env:
+          EXPECTED_SCHEMA_EVO_TESTS: "4"
         run: |
           REPORT="app/target/failsafe-reports/TEST-io.ledgerstream.app.SchemaEvolutionIT.xml"
           if [ ! -f "$REPORT" ]; then
@@ -57,8 +59,17 @@ jobs:
           SKIPPED=$(echo "$HEADER" | sed -n 's/.*skipped="\([0-9]*\)".*/\1/p')
           ERRORS=$(echo "$HEADER" | sed -n 's/.*errors="\([0-9]*\)".*/\1/p')
           FAILURES=$(echo "$HEADER" | sed -n 's/.*failures="\([0-9]*\)".*/\1/p')
-          echo "SchemaEvolutionIT: tests=${TESTS}, skipped=${SKIPPED}, errors=${ERRORS}, failures=${FAILURES}"
-          if [ -z "$TESTS" ] || [ "$TESTS" -lt 4 ] || [ "${SKIPPED:-1}" -ne 0 ] || [ "${ERRORS:-1}" -ne 0 ] || [ "${FAILURES:-1}" -ne 0 ]; then
-            echo "ERROR: SchemaEvolutionIT compatibility checks did not execute cleanly!"
+          echo "SchemaEvolutionIT: tests=${TESTS} (expected=${EXPECTED_SCHEMA_EVO_TESTS}), skipped=${SKIPPED}, errors=${ERRORS}, failures=${FAILURES}"
+          if [ -z "$TESTS" ] || [ "$TESTS" -ne "$EXPECTED_SCHEMA_EVO_TESTS" ] || [ "${SKIPPED:-1}" -ne 0 ] || [ "${ERRORS:-1}" -ne 0 ] || [ "${FAILURES:-1}" -ne 0 ]; then
+            echo "ERROR: SchemaEvolutionIT compatibility checks did not match expected count or had skips/errors!"
             exit 1
           fi
+          for REQUIRED_TEST in \
+            "direction1_v2ConsumerReadsV1DataAndResolvesNonNullDefault" \
+            "direction2_v1ConsumerReadsV2DataAndPayloadSchemaVersionMatchesV2RegistryId"; do
+            if ! grep -q "name=\"${REQUIRED_TEST}\"" "$REPORT"; then
+              echo "ERROR: Missing required bidirectional test case: ${REQUIRED_TEST}"
+              exit 1
+            fi
+            echo "Verified bidirectional test in report: ${REQUIRED_TEST}"
+          done

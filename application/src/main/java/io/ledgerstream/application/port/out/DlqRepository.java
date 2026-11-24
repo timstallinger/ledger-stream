@@ -13,7 +13,11 @@ public interface DlqRepository {
 
     List<DlqEntry> findUnhandled();
 
-    boolean markReplayed(UUID id, Instant replayedAt, String replayedBy, String note);
+    boolean markReplayed(UUID id, Instant replayedAt, String lastReplayedBy);
+
+    void recordReplayAttempt(DlqReplayAttempt attempt);
+
+    List<DlqReplayAttempt> findReplayAttempts(UUID dlqEntryId);
 
     long countUnhandled();
 }

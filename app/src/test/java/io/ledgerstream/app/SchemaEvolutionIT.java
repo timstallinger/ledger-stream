@@ -235,12 +235,23 @@ final class SchemaEvolutionIT {
         assertThat(rawV2Bytes).isNotNull();
 
         Integer wireSchemaId = RawPayloadPreservingAvroDeserializer.extractConfluentSchemaId(rawV2Bytes);
-        assertThat(wireSchemaId).isEqualTo(v2SchemaId);
+        int latestRegistrySchemaId = fetchLatestSubjectSchemaId(SUBJECT);
+        assertThat(wireSchemaId).isEqualTo(latestRegistrySchemaId);
+
+        Schema schemaFromRegistry = fetchSchemaById(wireSchemaId);
+        Schema v2Schema = LedgerBookingEvent.getClassSchema();
+        List<String> registryFieldNames = schemaFromRegistry.getFields().stream().map(Schema.Field::name).toList();
+        List<String> avscFieldNames = v2Schema.getFields().stream().map(Schema.Field::name).toList();
+        assertThat(registryFieldNames).containsExactlyElementsOf(avscFieldNames);
+        for (Schema.Field avscField : v2Schema.getFields()) {
+            Schema.Field regField = schemaFromRegistry.getField(avscField.name());
+            assertThat(regField).isNotNull();
+            assertThat(regField.schema().getType()).isEqualTo(avscField.schema().getType());
+        }
 
         Schema v1Schema = new Schema.Parser().parse(v1SchemaJson);
-        Schema v2Schema = LedgerBookingEvent.getClassSchema();
 
-        // Decode with v2 schema -> verify schemaVersion == 2 matches v2SchemaId AND initiationChannel == "API"
+        // Decode with v2 schema -> verify application schemaVersion == 2 AND initiationChannel == "API"
         GenericRecord v2Record = decodeWithReaderSchema(rawV2Bytes, v2Schema, v2Schema);
         assertThat(((Number) v2Record.get("schemaVersion")).intValue()).isEqualTo(2);
         assertThat(v2Record.get("initiationChannel").toString()).isEqualTo("API");
@@ -253,7 +264,8 @@ final class SchemaEvolutionIT {
         assertThat(v1ReadOfV2.getSchema().getField("initiationChannel")).isNull();
 
         System.out.println("DIRECTION_V1_READS_V2: passed wireSchemaId=" + wireSchemaId
-                + " expectedV2SchemaId=" + v2SchemaId
+                + " latestRegistrySchemaId=" + latestRegistrySchemaId
+                + " registryFieldsMatchAvsc=true"
                 + " payloadSchemaVersion=" + v2Record.get("schemaVersion")
                 + " v1ReadAmount=" + v1ReadOfV2.get("amount"));
     }
@@ -332,6 +344,19 @@ final class SchemaEvolutionIT {
     private static HttpResponse<String> httpGet(final String url) throws Exception {
         HttpClient client = HttpClient.newHttpClient();
         return client.send(HttpRequest.newBuilder(URI.create(url)).GET().build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static int fetchLatestSubjectSchemaId(final String subject) throws Exception {
+        HttpResponse<String> response = httpGet(schemaRegistryUrl() + "/subjects/" + subject + "/versions/latest");
+        assertThat(response.statusCode()).isEqualTo(200);
+        return STATIC_MAPPER.readTree(response.body()).get("id").asInt();
+    }
+
+    private static Schema fetchSchemaById(final int schemaId) throws Exception {
+        HttpResponse<String> response = httpGet(schemaRegistryUrl() + "/schemas/ids/" + schemaId);
+        assertThat(response.statusCode()).isEqualTo(200);
+        String rawSchema = STATIC_MAPPER.readTree(response.body()).get("schema").asText();
+        return new Schema.Parser().parse(rawSchema);
     }
 
     private static HttpResponse<String> registerSchema(final String subject, final String schemaJson) throws Exception {

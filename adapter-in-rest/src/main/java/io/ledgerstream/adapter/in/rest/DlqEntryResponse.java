@@ -20,8 +20,7 @@ public record DlqEntryResponse(
         Map<String, String> headers,
         Instant createdAt,
         Instant replayedAt,
-        String replayedBy,
-        String note
+        String lastReplayedBy
 ) {
 
     public static DlqEntryResponse from(final DlqEntry entry) {
@@ -39,8 +38,7 @@ public record DlqEntryResponse(
                 entry.headers(),
                 entry.createdAt(),
                 entry.replayedAt(),
-                entry.replayedBy(),
-                entry.note()
+                entry.lastReplayedBy()
         );
     }
 }

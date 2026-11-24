@@ -350,9 +350,15 @@ final class DlqAndRetryIT {
         assertThat(replayResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
         JsonNode replayJson = objectMapper.readTree(replayResponse.getBody());
         assertThat(replayJson.get("replayedAt").isNull()).isFalse();
-        assertThat(replayJson.get("replayedBy").asText()).isEqualTo("operator-t3");
-        assertThat(replayJson.get("note").asText()).isEqualTo("DB recovered");
+        assertThat(replayJson.get("lastReplayedBy").asText()).isEqualTo("operator-t3");
         assertThat(counterValue("dlq_replayed_total")).isEqualTo(replayedBefore + 1.0);
+        assertThat(dlqRepository.findReplayAttempts(dlqEntry.id()))
+                .singleElement()
+                .satisfies(attempt -> {
+                    assertThat(attempt.attemptedBy()).isEqualTo("operator-t3");
+                    assertThat(attempt.outcome()).isEqualTo("DISPATCHED");
+                    assertThat(attempt.note()).isEqualTo("DB recovered");
+                });
 
         AccountId domainAccountId = AccountId.of(UUID.fromString(accountId));
         awaitCondition(
@@ -514,8 +520,12 @@ final class DlqAndRetryIT {
     }
 
     @Test
-    void v2_failedReplayReopensExistingDlqEntryAndIncrementsAttemptCount() throws Exception {
-        String accountId = createAccount("DE-V2-" + shortId());
+    void n2_twoFailedReplaysRecordTwoImmutableHistoryRowsAndKeepSingleOpenDlqEntry() throws Exception {
+        // Isolate gauge check by ensuring no prior open rows remain from earlier test methods
+        jdbcClient.sql("UPDATE dlq_entries SET replayed_at = NOW() WHERE replayed_at IS NULL").update();
+        assertThat(gaugeValue("dlq_entries_unhandled")).isEqualTo(0.0);
+
+        String accountId = createAccount("DE-N2-" + shortId());
         UUID eventId = UUID.randomUUID();
         faultSwitch.failEvent(eventId);
 
@@ -529,21 +539,33 @@ final class DlqAndRetryIT {
 
         DlqEntry firstFailure = findDlqEntryByEventId(eventId).orElseThrow();
         assertThat(firstFailure.attemptCount()).isEqualTo(5);
+        assertThat(gaugeValue("dlq_entries_unhandled")).isEqualTo(1.0);
 
-        // Replay WITHOUT clearing the fault -> fails another 5 attempts and re-enters DLQ
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
-        ResponseEntity<String> replayResponse = restTemplate.postForEntity(
+
+        // Replay #1 WITHOUT clearing fault -> fails another 5 attempts -> attempt_count = 10
+        ResponseEntity<String> replay1 = restTemplate.postForEntity(
                 "/admin/dlq/" + firstFailure.id() + "/replay",
-                new HttpEntity<>("{\"replayedBy\":\"operator-v2\",\"note\":\"Premature replay before DB fix\"}", headers),
+                new HttpEntity<>("{\"replayedBy\":\"operator-1\",\"note\":\"First replay attempt\"}", headers),
                 String.class
         );
-        assertThat(replayResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
-
-        // Wait until the existing entry is reopened with attempt_count == 10 (5 + 5)
+        assertThat(replay1.getStatusCode()).isEqualTo(HttpStatus.OK);
         awaitCondition(
                 Duration.ofSeconds(30),
                 () -> findDlqEntryByEventId(eventId).map(e -> e.attemptCount() == 10).orElse(false)
+        );
+
+        // Replay #2 WITHOUT clearing fault -> fails another 5 attempts -> attempt_count = 15
+        ResponseEntity<String> replay2 = restTemplate.postForEntity(
+                "/admin/dlq/" + firstFailure.id() + "/replay",
+                new HttpEntity<>("{\"replayedBy\":\"operator-2\",\"note\":\"Second replay attempt\"}", headers),
+                String.class
+        );
+        assertThat(replay2.getStatusCode()).isEqualTo(HttpStatus.OK);
+        awaitCondition(
+                Duration.ofSeconds(30),
+                () -> findDlqEntryByEventId(eventId).map(e -> e.attemptCount() == 15).orElse(false)
         );
 
         Integer openCountForEvent = jdbcClient.sql(
@@ -556,17 +578,61 @@ final class DlqAndRetryIT {
                 .param("eventId", eventId)
                 .query(Integer.class)
                 .single();
-        List<Map<String, Object>> sqlRow = jdbcClient.sql(
-                        "SELECT id, event_id, error_class, attempt_count, replayed_at FROM dlq_entries WHERE event_id = :eventId")
-                .param("eventId", eventId)
-                .query()
-                .listOfRows();
-        System.out.println("V2_DLQ_REENTRY_SQL=" + sqlRow);
+        var attempts = dlqRepository.findReplayAttempts(firstFailure.id());
 
         assertThat(openCountForEvent).isEqualTo(1);
         assertThat(totalCountForEvent).isEqualTo(1);
+        assertThat(gaugeValue("dlq_entries_unhandled")).isEqualTo(1.0);
         assertThat(findDlqEntryByEventId(eventId).orElseThrow().id()).isEqualTo(firstFailure.id());
-        assertThat(findDlqEntryByEventId(eventId).orElseThrow().attemptCount()).isEqualTo(10);
+        assertThat(findDlqEntryByEventId(eventId).orElseThrow().attemptCount()).isEqualTo(15);
+        assertThat(findDlqEntryByEventId(eventId).orElseThrow().lastReplayedBy()).isEqualTo("operator-2");
+        assertThat(attempts).hasSize(2);
+        assertThat(attempts.get(0).attemptedBy()).isEqualTo("operator-1");
+        assertThat(attempts.get(0).note()).isEqualTo("First replay attempt");
+        assertThat(attempts.get(1).attemptedBy()).isEqualTo("operator-2");
+        assertThat(attempts.get(1).note()).isEqualTo("Second replay attempt");
+    }
+
+    @Test
+    void n3_identicalDeserializationPoisonSentThreeTimesDeduplicatesIntoSingleOpenEntryWithAttemptCountThree()
+            throws Exception {
+        byte[] corruptPayload = ("CORRUPT-NON-AVRO-" + shortId()).getBytes(StandardCharsets.UTF_8);
+        String payloadSha256 = io.ledgerstream.adapter.out.persistence.JdbcDlqRepository.sha256Hex(corruptPayload);
+        String key = "poison-key-" + shortId();
+
+        for (int i = 0; i < 3; i++) {
+            rawBytesKafkaTemplate.send(topicProperties.ledgerEvents(), key, corruptPayload).get(10, TimeUnit.SECONDS);
+        }
+
+        awaitCondition(
+                Duration.ofSeconds(20),
+                () -> jdbcClient.sql("""
+                                SELECT COALESCE(MAX(attempt_count), 0)
+                                FROM dlq_entries
+                                WHERE payload_sha256 = :hash AND replayed_at IS NULL
+                                """)
+                        .param("hash", payloadSha256)
+                        .query(Integer.class)
+                        .single() == 3
+        );
+
+        Integer openCount = jdbcClient.sql("""
+                        SELECT COUNT(*) FROM dlq_entries
+                        WHERE payload_sha256 = :hash AND replayed_at IS NULL
+                        """)
+                .param("hash", payloadSha256)
+                .query(Integer.class)
+                .single();
+        Integer totalCount = jdbcClient.sql("""
+                        SELECT COUNT(*) FROM dlq_entries
+                        WHERE payload_sha256 = :hash
+                        """)
+                .param("hash", payloadSha256)
+                .query(Integer.class)
+                .single();
+
+        assertThat(openCount).isEqualTo(1);
+        assertThat(totalCount).isEqualTo(1);
     }
 
     private Optional<DlqEntry> findDlqEntryByEventId(final UUID eventId) {

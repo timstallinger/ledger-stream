@@ -135,7 +135,6 @@ public final class DlqRecordPersister {
                 headerMap,
                 clock.instant(),
                 null,
-                null,
                 null
         );
 

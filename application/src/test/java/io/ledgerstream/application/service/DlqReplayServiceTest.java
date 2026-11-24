@@ -2,6 +2,7 @@ package io.ledgerstream.application.service;
 
 import io.ledgerstream.application.port.in.ReplayDlqCommand;
 import io.ledgerstream.application.port.out.DlqEntry;
+import io.ledgerstream.application.port.out.DlqReplayAttempt;
 import io.ledgerstream.application.port.out.DlqRepository;
 import io.ledgerstream.application.port.out.TransactionRunner;
 import io.ledgerstream.domain.exception.DlqEntryAlreadyReplayedException;
@@ -27,7 +28,7 @@ final class DlqReplayServiceTest {
     private static final Instant T0 = Instant.parse("2026-01-01T12:00:00Z");
 
     @Test
-    void replaysUnhandledEntryOnceAndRejectsSecondReplayAndUnknownId() {
+    void replaysUnhandledEntryOnceRecordsImmutableAttemptAndRejectsSecondReplayAndUnknownId() {
         InMemoryDlqRepository repository = new InMemoryDlqRepository();
         UUID entryId = UUID.randomUUID();
         byte[] rawPayload = new byte[]{0x00, 0x00, 0x00, 0x00, 0x01, 0x42};
@@ -44,7 +45,6 @@ final class DlqReplayServiceTest {
                 rawPayload,
                 Map.of("correlationId", "corr-1"),
                 T0,
-                null,
                 null,
                 null
         ));
@@ -67,12 +67,17 @@ final class DlqReplayServiceTest {
         DlqEntry replayed = service.replay(new ReplayDlqCommand(entryId, "ops-user", "Fixed DB"));
 
         assertThat(replayed.replayedAt()).isEqualTo(T0.plusSeconds(30));
-        assertThat(replayed.replayedBy()).isEqualTo("ops-user");
-        assertThat(replayed.note()).isEqualTo("Fixed DB");
+        assertThat(replayed.lastReplayedBy()).isEqualTo("ops-user");
         assertThat(publishedPayloads).hasSize(1);
         assertThat(publishedPayloads.getFirst()).isEqualTo(rawPayload);
         assertThat(observedReplays).containsExactly(entryId);
         assertThat(repository.countUnhandled()).isZero();
+        assertThat(repository.findReplayAttempts(entryId)).hasSize(1);
+        DlqReplayAttempt attempt = repository.findReplayAttempts(entryId).getFirst();
+        assertThat(attempt.attemptedBy()).isEqualTo("ops-user");
+        assertThat(attempt.outcome()).isEqualTo("DISPATCHED");
+        assertThat(attempt.errorClass()).isNull();
+        assertThat(attempt.note()).isEqualTo("Fixed DB");
 
         assertThatThrownBy(() -> service.replay(new ReplayDlqCommand(entryId, "ops-user", "Retry")))
                 .isInstanceOf(DlqEntryAlreadyReplayedException.class);
@@ -82,6 +87,7 @@ final class DlqReplayServiceTest {
 
     private static final class InMemoryDlqRepository implements DlqRepository {
         private final Map<UUID, DlqEntry> entries = new HashMap<>();
+        private final List<DlqReplayAttempt> attempts = new ArrayList<>();
 
         @Override
         public void save(final DlqEntry entry) {
@@ -99,13 +105,23 @@ final class DlqReplayServiceTest {
         }
 
         @Override
-        public boolean markReplayed(final UUID id, final Instant replayedAt, final String replayedBy, final String note) {
+        public boolean markReplayed(final UUID id, final Instant replayedAt, final String lastReplayedBy) {
             DlqEntry current = entries.get(id);
             if (current == null || current.replayedAt() != null) {
                 return false;
             }
-            entries.put(id, current.withReplayMetadata(replayedAt, replayedBy, note));
+            entries.put(id, current.withReplayState(replayedAt, lastReplayedBy));
             return true;
+        }
+
+        @Override
+        public void recordReplayAttempt(final DlqReplayAttempt attempt) {
+            attempts.add(attempt);
+        }
+
+        @Override
+        public List<DlqReplayAttempt> findReplayAttempts(final UUID dlqEntryId) {
+            return attempts.stream().filter(a -> a.dlqEntryId().equals(dlqEntryId)).toList();
         }
 
         @Override
