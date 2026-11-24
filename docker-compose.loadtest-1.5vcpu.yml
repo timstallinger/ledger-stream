@@ -31,3 +31,5 @@ services:
     cpus: 0.015
   grafana:
     cpus: 0.015
+    healthcheck:
+      retries: 100

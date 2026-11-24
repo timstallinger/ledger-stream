@@ -178,7 +178,7 @@ final class IdempotentConsumerIT {
         ResponseEntity<String> prometheus = restTemplate.getForEntity("/actuator/prometheus", String.class);
         assertThat(prometheus.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(prometheus.getBody()).contains("consumer_duplicates_rejected_total{reason=\"duplicate\"}");
-        assertThat(prometheus.getBody()).contains("consumer_duplicates_rejected_total{reason=\"poison\"}");
+        assertThat(prometheus.getBody()).contains("consumer_poison_total");
         prometheus.getBody().lines()
                 .filter(line -> !line.startsWith("#"))
                 .filter(line -> line.startsWith("outbox_") || line.startsWith("consumer_"))
@@ -526,6 +526,11 @@ final class IdempotentConsumerIT {
     }
 
     private double rejectedCounter(final String reason) {
+        if ("poison".equals(reason)) {
+            Counter counter = meterRegistry.find("consumer_poison_total").counter();
+            assertThat(counter).isNotNull();
+            return counter.count();
+        }
         Counter counter = meterRegistry.find("consumer_duplicates_rejected_total")
                 .tag("reason", reason)
                 .counter();
