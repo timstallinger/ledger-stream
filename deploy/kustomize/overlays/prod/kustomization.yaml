@@ -21,6 +21,6 @@ images:
   - name: ghcr.io/timstallinger/ledger-stream-app
     digest: sha256:597ae35c6c5acd76aafd1a0a3dbf40be8ef16b42e98f21495fb1288ada69d0f0
   - name: ghcr.io/timstallinger/ledger-stream-frontend
-    digest: sha256:19a5a6a0c5f269a4aab2a69a8c3b821cf41f63aa723416240db7f9f94376aab2
+    digest: sha256:4f0d0405f92400ce54fe321e13b61c0ec167cd2eef553dc3dc82eb72ce63438f
   - name: ghcr.io/timstallinger/ledger-stream-keycloak
     digest: sha256:51132d1ab47a498d18ca67af5750f9373c1506fd1065c604dd5e5740e32ed6bf
