@@ -36,4 +36,7 @@ USER appuser
 ENV JAVA_OPTS="-XX:MaxRAMPercentage=60.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
 EXPOSE 8080
 
-ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/ledger-stream.jar"]
+# Forward SIGTERM/SIGINT to the JVM so Spring Boot graceful shutdown runs cleanly.
+# Translate JVM's normal SIGTERM exit code (143 = 128 + 15) to 0 so Kubernetes records
+# reason=Completed instead of Error while preserving genuine non-zero crash exit codes.
+ENTRYPOINT ["sh", "-c", "trap 'kill -TERM $PID; wait $PID; EC=$?; [ \"$EC\" -eq 143 ] && exit 0 || exit \"$EC\"' TERM INT; java $JAVA_OPTS -jar /app/ledger-stream.jar & PID=$!; wait $PID"]

@@ -1,6 +1,8 @@
 spring:
   application:
     name: ledger-stream
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/ledger}
     username: ${DB_USERNAME:ledger}
@@ -37,6 +39,7 @@ spring:
 
 server:
   port: ${SERVER_PORT:8080}
+  shutdown: graceful
 
 ledger:
   admin:

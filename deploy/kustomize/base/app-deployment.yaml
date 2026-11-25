@@ -33,6 +33,7 @@ spec:
         app: app
     spec:
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 100
@@ -80,6 +81,10 @@ spec:
             limits:
               memory: 640Mi
               cpu: 1000m
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
           startupProbe:
             httpGet:
               path: /actuator/health/readiness
