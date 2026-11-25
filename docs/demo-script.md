@@ -1,6 +1,6 @@
 # Live-Demo-Skript (`ledger-stream`)
 
-**Gesamtdauer:** ~12 Minuten (Unconstrained-Profil, Lastlauf ~2–3 min) · alternativ ~25–30 Minuten unter harter `1,5 vCPU`-Drosselung (`docker-compose.loadtest-1.5vcpu.yml`, Lastlauf ~20 min).
+**Gesamtdauer:** **~15 Minuten** im Unconstrained-Profil (inkl. verbindlichem Stack-Reset vor dem 100k-Lauf mit `20–40 s` Keycloak-Start + ~2–3 min Lastlauf) · alternativ ~30–35 Minuten unter harter `1,5 vCPU`-Drosselung (`docker-compose.loadtest-1.5vcpu.yml`, Lastlauf ~20 min).
 
 **Einstiegs-Pitch (30 Sekunden, vor Schritt 1):**
 
@@ -11,10 +11,11 @@
 ## Vorbereitung (vor dem Termin, T − 5 min)
 
 ```bash
-# 1. Kompletten 8-Container-Stack im Unconstrained-Demo-Profil starten
-#    (für die 1,5-vCPU-Demo stattdessen -f docker-compose.loadtest-1.5vcpu.yml verwenden)
+# 1. Stack inkl. zweitem Admin-Profil starten:
+#    - app       (:8085) mit LEDGER_ADMIN_ENABLED=false  (Standard / prod-Verhalten -> 404)
+#    - app-admin (:8086) mit LEDGER_ADMIN_ENABLED=true   (nur für Schritt 5 RBAC/Replay-Kontrast)
 export SERVER_PORT=8085 POSTGRES_HOST_PORT=5433
-docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d --wait
+docker compose -f docker-compose.yml -f docker-compose.loadtest.yml -f docker-compose.demo-admin.yml up -d --wait
 
 # 2. Drei Browser-Tabs vorab öffnen:
 #    Tab 1: SPA       http://localhost:3000
@@ -77,14 +78,18 @@ docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d --wait
 - **Erwartung:** `HTTP/1.1 422`, `type: urn:ledger-stream:error:idempotency-key-reuse`, Saldo bleibt unverändert (`135,00 €`).
 - **Erzählbogen:** „Genau hier trennt sich **Idempotenz** von bloßer **Deduplizierung**: Wir hashen die kanonischen Geschäftsfelder (`request_fingerprint`, SHA-256). Gleicher Key + gleicher Inhalt liefert die gespeicherte Antwort; gleicher Key + anderer Betrag darf niemals stillschweigend die alte Antwort zurückgeben, sondern knallt sauber mit `422`.“
 
-### Schritt 5 — `404`-vor-`401`-Invariante, Poison → DLQ & Replay als `operator` (04:00 – 06:00)
+### Schritt 5 — Kontrast `404` vs. `200` ohne Neustart, Poison → DLQ & Replay als `operator` (04:00 – 06:00)
 
-- **1. `404`-vor-`401` demonstrieren (im Default-/`prod`-Betrieb ist `LEDGER_ADMIN_ENABLED=false`):**
+Dank [`docker-compose.demo-admin.yml`](../docker-compose.demo-admin.yml) laufen `app` (`:8085`, `LEDGER_ADMIN_ENABLED=false`) und `app-admin` (`:8086`, `LEDGER_ADMIN_ENABLED=true`) gleichzeitig auf derselben Datenbank — **einziger Verhaltensunterschied ist die Umgebungsvariable `LEDGER_ADMIN_ENABLED`**, kein Neustart nötig:
+
+- **1. Direkter Kontrast `404`-vor-`401` (`:8085`) vs. `401` (`:8086`):**
   ```bash
-  # Ohne Token UND mit writer-Token -> immer 404 (verraet die Admin-Route nicht einmal)
+  # Port 8085 (LEDGER_ADMIN_ENABLED=false, prod-Default) -> 404 Not Found noch VOR OIDC
   curl -i -s "http://127.0.0.1:8085/admin/dlq" | head -n 5
+
+  # Port 8086 (LEDGER_ADMIN_ENABLED=true, gleicher Code/Image) -> 401 Unauthorized ohne Token
+  curl -i -s "http://127.0.0.1:8086/admin/dlq" | head -n 5
   ```
-  - **Hinweis:** Für die Live-Replay-Demo lokal mit `LEDGER_ADMIN_ENABLED=true` starten (bzw. im `prod`-Overlay gemäß [`docs/operations.md` Abschnitt 2.6](operations.md#26-dlq-replay-im-prod-overlay-aktivieren) per GitOps-Wartungsfenster).
 - **2. Poison-Event direkt in Kafka einspeisen & in `dlq_entries` sichtbar machen:**
   ```bash
   # Korruptes Nicht-Avro-Record direkt ins Topic ledger.events -> 0 Retries, landet sofort in DLQ
@@ -92,34 +97,40 @@ docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d --wait
     /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:29092 \
     --topic ledger.events --property "parse.key=true" --property "key.separator=:"
 
-  # Pruefen: Rohbytes erhalten (x-original-payload) & genau 1 offener DLQ-Eintrag
+  # Prüfen: Rohbytes erhalten (x-original-payload) & genau 1 offener DLQ-Eintrag
   docker exec ledger-stream-postgres psql -U ledger -d ledger -c \
     "SELECT id, error_class, attempt_count, replayed_at FROM dlq_entries ORDER BY created_at DESC LIMIT 3;"
   ```
-- **3. RBAC-Nachweis (`writer` → `403`, `operator` → `200` + Replay-Audit-Trail):**
+- **3. RBAC-Nachweis auf Port `8086` (`writer` → `403`, `operator` → `200` + Replay-Audit-Trail):**
   ```bash
-  # Mit writer-Token (bei LEDGER_ADMIN_ENABLED=true) -> 403 Forbidden
-  curl -i -s "http://127.0.0.1:8085/admin/dlq" -H "Authorization: Bearer $WRITER_TOKEN" | head -n 5
+  # writer auf :8086 -> 403 Forbidden (Separation of Duties)
+  curl -i -s "http://127.0.0.1:8086/admin/dlq" -H "Authorization: Bearer $WRITER_TOKEN" | head -n 5
 
-  # Mit operator-Token -> 200 OK (Liste) & POST /admin/dlq/{id}/replay (Audit in dlq_replay_attempts)
+  # operator auf :8086 -> 200 OK (Liste) & POST /admin/dlq/{id}/replay (Audit in dlq_replay_attempts)
   OP_TOKEN=$(curl -fsS -X POST "http://localhost:8180/realms/ledger-stream/protocol/openid-connect/token" \
     -d "client_id=ledger-stream-cli&client_secret=change_me_local_cli_secret&grant_type=password&username=operator&password=operator" \
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
 
-  DLQ_ID=$(curl -fsS "http://127.0.0.1:8085/admin/dlq" -H "Authorization: Bearer $OP_TOKEN" \
+  DLQ_ID=$(curl -fsS "http://127.0.0.1:8086/admin/dlq" -H "Authorization: Bearer $OP_TOKEN" \
     | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])')
 
-  curl -i -s -X POST "http://127.0.0.1:8085/admin/dlq/${DLQ_ID}/replay" \
+  curl -i -s -X POST "http://127.0.0.1:8086/admin/dlq/${DLQ_ID}/replay" \
     -H "Authorization: Bearer $OP_TOKEN" -H "Content-Type: application/json" \
     -d '{"note":"Live-Demo Replay"}' | head -n 10
   ```
-- **Erzählbogen:** „Deserialisierungs- und fachliche Fehler bekommen 0 Retries — sie blockieren keine Partition, und `RawPayloadPreservingAvroDeserializer` rettet die exakten Rohbytes. Ein `writer` darf niemals DLQ-Payloads sehen (`403`), im `prod`-Overlay liefert `/admin/**` standardmäßig sogar `404` vor `401`.“
+- **Erzählbogen:** „Hier auf `:8085` gibt es `404` vor `401`, hier auf `:8086` liefert dasselbe Image `200` für `operator` und `403` für `writer` — einziger Unterschied ist `LEDGER_ADMIN_ENABLED`. Deserialisierungsfehler erhalten 0 Retries, blockieren keine Partition, und `RawPayloadPreservingAvroDeserializer` rettet die exakten Rohbytes.“
 
-### Schritt 6 — 100.000-Buchungen-Lastlauf starten (06:00 – 06:30)
+### Schritt 6 — Pflicht-Reset (`6a`) & 100.000-Buchungen-Lastlauf starten (`6b`) (06:00 – 07:30)
 
-- **Befehl (Terminal, reproduzierbarer Seed `20261124`):**
+- **Schritt 6a — Verbindlicher Stack-Reset (KEINE Option!):**
+  Schritte 2–5 haben `3` manuelle Buchungen (`135,00 €`) und `1` manuelles Poison-Event erzeugt. Ohne Reset bricht der `InvariantChecker` am Ende des 100k-Laufs (`bookings = 100.003 != 100.000`, `dlq_entries = 1.001 != 1.000`). Deshalb zuerst sauber zurücksetzen (~45–60 s inkl. Keycloak-Start `20–40 s`):
   ```bash
-  # Frischen Stack für saubere 100k-Invarianten starten (falls Schritte 2–5 auf demselben Stack liefen)
+  export SERVER_PORT=8085 POSTGRES_HOST_PORT=5433
+  docker compose -f docker-compose.yml -f docker-compose.loadtest.yml -f docker-compose.demo-admin.yml down -v
+  docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d --wait
+  ```
+- **Schritt 6b — 100.000-Buchungen-Lastlauf starten (reproduzierbarer Seed `20261124`):**
+  ```bash
   java -Djdk.httpclient.keepalive.timeout=60 \
     -jar load-generator/target/load-generator-0.1.0-SNAPSHOT-shaded.jar \
     --bookings=100000 --duplicates=0.05 --poison=0.01 --seed=20261124 \
@@ -136,18 +147,18 @@ docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d --wait
     --drain-timeout-seconds=1800
   ```
 
-### Schritt 7 — Was du *sagst*, während die 100.000 Buchungen laufen (06:30 – 09:00 · bzw. ~20 min unter `1,5 vCPU`)
+### Schritt 7 — Was du *sagst*, während die 100.000 Buchungen laufen (07:30 – 11:00 · bzw. ~20 min unter `1,5 vCPU`)
 
 - **Klickpfad:** Sofort auf **Tab 2 (Grafana `http://localhost:3001/d/ledger-stream-overview`)** wechseln, Auto-Refresh auf **`5s`** stellen.
 - **Konkrete Panels zeigen & erklären (in dieser Reihenfolge):**
-  1. **Panel `Outbox Unsent` (`outbox_unsent`) & `Oldest Pending Age`:**
+  1. **Panel `Outbox-Rückstand (PENDING)` & `Outbox Oldest Pending Age (s)`:**
      - **Wörtlicher Erzählpunkt:** „Unconstrained ist der Schreibpfad 1,6× schneller als die Projektion (`1064,2 Buch./s` vs. `659,2 Events/s`). Die Outbox puffert die Differenz — `max(outbox_unsent) = 8.549` — und drainiert sie nach dem HTTP-Burst in `103,35 s` sauber auf `0`. Unter `1,5 vCPU` (~20 min Gesamtlauf) kehrt sich der Engpass um: Die API ist auf `84,8 Buch./s` gedrosselt, die Projektion kommt mit `249,8 Events/s` problemlos hinterher (`max 1.320`). Der Rückstand ist kein Defekt, sondern der sichtbare Beweis, dass Annahme und Verarbeitung entkoppelt sind: Die Differenz wird sichtbar statt zum Datenverlust.“
-     - Auf die rote `300s`-Alarmschwelle in `outbox_oldest_pending_age_seconds` zeigen: „Solange das Alter weit unter `300 s` bleibt, arbeitet das Relay — alarmiert wird erst bei echtem Stillstand.“
-  2. **Panel `HTTP Latency p95 / p99`:** Unterschied Client-Latenz vs. Server-Histogramm (`uri!~"/actuator.*"`) kurz benennen.
-  3. **Panel `DLQ Unhandled` & `Consumer Poison vs. Duplicates`:** Zeigen, wie `consumer_poison_total` und `dlq_entries_unhandled` synchron auf `1.000` laufen, während `consumer_duplicates_rejected_total{reason="duplicate"}` auf **`0`** bleibt (weil alle `5.000` L2-Duplikate bereits an der HTTP-API abgefangen wurden).
-  4. **Parallel im Terminal (wenn unter `1,5 vCPU` mehr Zeit ist):** Keycloak-Speicheraufschlüsselung aus [`README.md`](../README.md) ansprechen („Kern-Stack `1,14 GiB` `anon`, Keycloak als externer IdP weitere `473,82 MiB` = `28,9 %` → ehrlich `1,75 GiB` mit IdP“).
+     - Auf die rote `300s`-Alarmschwelle zeigen: „Solange das Alter weit unter `300 s` bleibt, arbeitet das Relay — alarmiert wird erst bei echtem Stillstand.“
+  2. **Panel `HTTP API Latenz (p95 / p99, ohne /actuator)`:** Unterschied Client-Latenz vs. Server-Histogramm kurz benennen.
+  3. **Panel `DLQ offen` & `Consumer-Duplikate & Poison-Events`:** Zeigen, wie `poison` und `DLQ offen` synchron auf `1.000` laufen, während `duplicates` (`consumer_duplicates_rejected_total{reason="duplicate"}`) auf **`0`** bleibt (alle `5.000` L2-Duplikate wurden synchron an der HTTP-API abgefangen).
+  4. **Parallel (besonders unter `1,5 vCPU`):** Keycloak-Speicheraufschlüsselung aus [`README.md`](../README.md) ansprechen („Kern-Stack `1163,62 MiB` = `1,14 GiB` `anon`, Keycloak als externer IdP weitere `473,82 MiB` = `28,9 %` → `1,75 GiB` mit IdP, `1,14 GiB` ohne“).
 
-### Schritt 8 — Invarianten-Check & Ergebnisabnahme (09:00 – 10:30)
+### Schritt 8 — Invarianten-Check & Ergebnisabnahme (11:00 – 13:00)
 
 - **Blick ins Terminal (Ende des `load-generator`-Laufs):**
   - `INVARIANT_CHECK_RESULT=PASS (EXIT_CODE=0)`
@@ -158,26 +169,26 @@ docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d --wait
     4. `dlq_entries` == `consumer_poison_total` == `1.000` (`diff = 0`)
     5. 10/10 Stichprobenkonten: Summe in `bookings` == Saldo in `account_summary` (centgenau `0,00 EUR` Abweichung, deterministisch bei Seed `20261124`).
 
-### Schritt 9 — GitOps, Supply Chain & Abschluss-Satz (10:30 – 12:00)
+### Schritt 9 — GitOps, Supply Chain & Abschluss-Satz (13:00 – 15:00)
 
 - **Kurz zeigen (Terminal / Browser):**
-  - [`deploy/kustomize/overlays/prod/kustomization.yaml`](../deploy/kustomize/overlays/prod/kustomization.yaml): `LEDGER_ADMIN_ENABLED=false`, `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL=FULL`, `app`-`RollingUpdate`, unveränderliche `@sha256:`-Digests (signiert mit Keyless-Cosign + CycloneDX-1.6-SBOM).
+  - [`deploy/kustomize/overlays/prod/kustomization.yaml`](../deploy/kustomize/overlays/prod/kustomization.yaml): `LEDGER_ADMIN_ENABLED=false`, `SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL=FULL`, `app`-`RollingUpdate` (`maxSurge: 25%`, `maxUnavailable: 25%`, `preStop: sleep 5`, `server.shutdown: graceful`), unveränderliche `@sha256:`-Digests (signiert mit Keyless-Cosign + CycloneDX-1.6-SBOM).
   - [`deploy/argocd/application.yaml`](../deploy/argocd/application.yaml): deklaratives Pull-GitOps (`selfHeal: true`, `prune: true`, Rollback per `git revert`).
 - **Abschluss-Satz:**
   > „100.000 Buchungen akzeptiert, 5.000 echte Idempotenz-Replays ohne Zweiteffekt, 1.000 Poison-Events isoliert in der DLQ — die Summe im Ledger entspricht exakt den akzeptierten Anfragen, 0,00 EUR Abweichung, 10 von 10 Stichprobenkonten centgenau identisch über alle drei Lastprofile.“
 
 ---
 
-## Offline-Fallback (falls der Live-Stack nicht startet)
+## Offline-Fallback (falls der Live-Stack nicht startet — ohne Docker, Netz oder Zusatztools)
 
-Falls vor Ort kein Docker/Netzwerk verfügbar ist oder ein Container beim Aufbau hängt, liegen direkt im Repository zwei echte Aufzeichnungen aus dem Live-100k-Lauf (`Seed 20261124`, Unconstrained):
+Direkt im Repository unter [`docs/demo/`](demo/) liegen drei Artefakte aus einem echten, vollständigen **100.000-Buchungen-Lauf** (`Seed 20261124`, Unconstrained):
 
-1. **Terminal-Aufzeichnung des vollständigen 100k-Laufs (`asciicast v2`):**
+1. **Plain-Text-Transcript ohne jede Tool-Abhängigkeit (funktioniert auf jedem Rechner mit `cat`/`less`):**
+   - Datei: [`docs/demo/loadtest-100k.txt`](demo/loadtest-100k.txt)
+   - Ansicht: `less docs/demo/loadtest-100k.txt`
+2. **Interaktive Terminal-Aufzeichnung (`asciicast v2`, optional mit `asciinema`):**
    - Datei: [`docs/demo/loadtest-100k.cast`](demo/loadtest-100k.cast)
-   - Wiedergabe (mit doppelter Geschwindigkeit für zügige Demo):
-     ```bash
-     asciinema play -s 2 docs/demo/loadtest-100k.cast
-     ```
-2. **Statischer Grafana-Screenshot eines Live-Lastlaufs (`20.000` Buchungen, `1.000` L2-Duplikate, `200` Poison-Events — alle 8 Panels inkl. Outbox-Spike & Drain auf `0`, Durchsatz Outbox vs. Consumer, `duplicates = 0` vs. `poison = 200`, HTTP p95/p99):**
-   - Datei: [`docs/demo/grafana-overview-loadtest.png`](demo/grafana-overview-loadtest.png)
-   - Direkt im Browser/Image-Viewer öffnen und Schritt 7 anhand der realen Kurven erzählen.
+   - Wiedergabe: `asciinema play -s 2 docs/demo/loadtest-100k.cast`
+3. **Statischer Grafana-Screenshot desselben 100.000-Buchungen-Laufs (`100.000` reguläre Buchungen, `5.000` L2-Duplikate, `1.000` Poison-Events → `DLQ offen = 1000`, Outbox-Spike & Drain auf `0`, Durchsatz Outbox vs. Consumer, HTTP p95/p99):**
+   - Datei: [`docs/demo/grafana-overview-100k.png`](demo/grafana-overview-100k.png)
+   - Direkt im Browser/Image-Viewer öffnen und Schritt 7 anhand der realen 100k-Kurven erzählen.

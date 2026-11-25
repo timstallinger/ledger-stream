@@ -91,9 +91,12 @@ ORDER BY attempted_at ASC;
 
 - **Berechtigung (Separation of Duties):** Ausschließlich Benutzer mit der Keycloak-Realm-Rolle **`operator`** (`ROLE_operator`) — `viewer` und `writer` erhalten `403 Forbidden`.
 - **Feature-Flag-Schutz (404-vor-401-Invariante):** Im Produktions-Overlay [`deploy/kustomize/overlays/prod/kustomization.yaml`](../deploy/kustomize/overlays/prod/kustomization.yaml) ist `LEDGER_ADMIN_ENABLED=false` gepinnt (`/admin/**` liefert stets `404` vor OIDC-Prüfung). Ein Replay erfordert ein bewusstes Wartungsfenster / kurzzeitige Freischaltung oder einen dedizierten Operator-Pod mit `LEDGER_ADMIN_ENABLED=true`.
-- **Aufruf:**
+- **Aufruf (im Cluster per `port-forward`):**
   ```bash
-  curl -X POST "http://<app-host>:8080/admin/dlq/<dlq-entry-uuid>/replay" \
+  # In-Cluster-Service lokal weiterleiten (separates Terminal)
+  kubectl -n ledger-stream port-forward svc/app 8080:8080
+
+  curl -fsS -X POST "http://127.0.0.1:8080/admin/dlq/<dlq-entry-uuid>/replay" \
     -H "Authorization: Bearer <operator-jwt>" \
     -H "Content-Type: application/json" \
     -d '{"note":"DB-Störung behoben, kontrolliertes Replay"}'
@@ -106,14 +109,17 @@ In [`deploy/kustomize/overlays/prod/kustomization.yaml`](../deploy/kustomize/ove
 
 1. **Wartungsfenster öffnen:** In [`deploy/kustomize/overlays/prod/kustomization.yaml`](../deploy/kustomize/overlays/prod/kustomization.yaml#L16) `LEDGER_ADMIN_ENABLED=true` setzen.
 2. **Deklarativ ausrollen:** `git commit` + `git push origin main` → ArgoCD synct selbstständig; warten, bis `argocd app get ledger-stream` wieder **`Synced + Healthy`** meldet.
-3. **Replay als `operator` ausführen:**
+3. **Port-Forward öffnen & Replay als `operator` ausführen:**
    ```bash
-   curl -fsS -X POST "http://<app-host>:8080/admin/dlq/<dlq-entry-uuid>/replay" \
+   # In-Cluster-Port 8080 lokal verfügbar machen (separates Terminal)
+   kubectl -n ledger-stream port-forward svc/app 8080:8080
+
+   curl -fsS -X POST "http://127.0.0.1:8080/admin/dlq/<dlq-entry-uuid>/replay" \
      -H "Authorization: Bearer <operator-jwt>" \
      -H "Content-Type: application/json" \
      -d '{"note":"Ursache behoben, kontrolliertes Prod-Replay"}'
    ```
-4. **Wartungsfenster sofort schließen:** `LEDGER_ADMIN_ENABLED=false` zurücksetzen, `git commit` + `git push origin main`, ArgoCD-Sync abwarten und erneut verifizieren, dass `GET /admin/dlq` wieder **`404 Not Found`** (ohne Token und mit `operator`-Token) liefert.
+4. **Wartungsfenster sofort schließen:** `LEDGER_ADMIN_ENABLED=false` zurücksetzen, `git commit` + `git push origin main`, ArgoCD-Sync abwarten und erneut per `port-forward` verifizieren, dass `GET http://127.0.0.1:8080/admin/dlq` wieder **`404 Not Found`** (ohne Token und mit `operator`-Token) liefert.
 
 - **Berechtigung & Audit-Trail:** Ausschließlich die Keycloak-Rolle **`operator`** (`ROLE_operator`) darf `/admin/dlq/**` aufrufen (`viewer`/`writer` erhalten `403`). Jeder Versuch wird unveränderlich in `dlq_replay_attempts` (`attempted_at`, `attempted_by` aus dem JWT-Subject, `outcome`, `error_class`, `note`) protokolliert.
 - **Sicherheitshinweis:** Während des geöffneten Wartungsfensters ist `/admin/dlq/**` über das Cluster-Netz erreichbar (abgesichert durch OIDC + `ROLE_operator`); das Fenster ist daher unmittelbar nach Abschluss des Replays wieder zu schließen.
@@ -138,7 +144,7 @@ Unter `ServerSideApply=true` bleiben zusätzliche, nicht Git-verwaltete Felder (
 
 ### Was passiert während des Rollbacks mit laufenden Buchungen?
 
-- **Strategie `RollingUpdate` im `prod`-Overlay (`app`) vs. `Recreate` (`local`/übrige Services):** Im `prod`-Overlay fährt `app` `RollingUpdate` (`maxSurge: 25%`, `maxUnavailable: 25%` — bei `replicas: 1` startet Kubernetes erst den neuen `app`-Pod bis `Ready`, bevor der alte `SIGTERM` erhält; Quota-Hard `2000m`/`2304Mi` hält genau diesen einen Surge-Pod vor). In `local` (`Recreate`) wird zuerst `SIGTERM` gesendet (`terminationGracePeriodSeconds: 30`); Spring Boot fährt Tomcat graceful herunter (laufende HTTP-Requests committen oder rollen atomar zurück).
+- **Strategie `RollingUpdate` im `prod`-Overlay (`app`) & Graceful Shutdown:** Im `prod`-Overlay fährt `app` `RollingUpdate` (`maxSurge: 25%`, `maxUnavailable: 25%` — bei `replicas: 1` startet Kubernetes erst den neuen `app`-Pod bis `Ready`, bevor der alte terminiert; Quota-Hard `2000m`/`2304Mi` hält genau diesen einen Surge-Pod vor). Beim Beenden des alten Pods wartet der `preStop`-Hook (`sleep 5`) fünf Sekunden, bis der Endpoints-Controller den Pod aus dem Service entfernt hat; anschließend empfängt Spring Boot `SIGTERM` mit `server.shutdown: graceful`, `spring.lifecycle.timeout-per-shutdown-phase: 30s` und `terminationGracePeriodSeconds: 45` (Tomcat-Requests, Kafka-Consumer und Outbox-Relay fahren sauber herunter, Container endet mit `exitCode: 0`, `reason: Completed`). In `local` (`Recreate`) läuft derselbe Graceful-Shutdown ohne parallelen Surge-Pod.
 - **Clients während des kurzen Neustartfensters:** Neue HTTP-Requests erhalten kurzzeitig Verbindungsfehler / `503`. Dank clientseitigem `Idempotency-Key` (im Frontend vor Submit erzeugt und beibehalten) kann jeder Client gefahrlos mit demselben Key wiederholen — wurde die Buchung vor `SIGTERM` bereits committed, liefert die zurückgerollte Version byte-gleich die gecachte Antwort (`201 + Idempotency-Replayed: true`); wurde sie gerollt, wird sie genau einmal neu gebucht.
 - **Outbox & Consumer:** Unversendete `PENDING`-Events verbleiben sicher in PostgreSQL (`outbox_events`) und werden nach Start des alten Pods weiter ausgeliefert. Dank Schema-Kompatibilität **`FULL`** ([ADR-0005](adr/0005-avro-full-compatibility-statt-backward.md)) kann die ältere App-Version auch bereits von der neueren Version geschriebene Avro-Events dekodieren.
 - **Wichtige Grenze:** Flyway-Migrationen sind vorwärtsgerichtet (Expand-Contract-Prinzip). Ein App-Rollback ist nur dann sicher, wenn Datenbank-Migrationen der neueren Version abwärtskompatibel zur vorherigen App-Version geblieben sind (keine destruktiven `DROP COLUMN` im selben Release).

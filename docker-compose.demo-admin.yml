@@ -1,0 +1,44 @@
+# Optional Compose override for live demo step 5:
+# Runs a second app container (app-admin) on port 8086 whose ONLY behavioral difference
+# from app (:8085, LEDGER_ADMIN_ENABLED=false) is LEDGER_ADMIN_ENABLED=true.
+# Consumer and Outbox relay are disabled on app-admin so only HTTP/admin endpoints run here.
+services:
+  app-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ledger-stream-app:0.1.0
+    container_name: ledger-stream-app-admin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-ledger}
+      DB_USERNAME: ${POSTGRES_USER:-ledger}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-ledger_local_dev}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      OIDC_ISSUER_URI: ${OIDC_ISSUER_URI:-http://localhost:8180/realms/ledger-stream}
+      OIDC_JWK_SET_URI: http://keycloak:8080/realms/ledger-stream/protocol/openid-connect/certs
+      OIDC_EXPECTED_AUDIENCE: ledger-stream-api
+      LEDGER_ADMIN_ENABLED: "true"
+      KAFKA_CONSUMER_ENABLED: "false"
+      OUTBOX_RELAY_ENABLED: "false"
+      DB_POOL_MAX_SIZE: 5
+      JAVA_OPTS: "-XX:MaxRAMPercentage=60.0 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+    ports:
+      - "${ADMIN_SERVER_PORT:-8086}:8080"
+    mem_limit: 384m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health/readiness | grep -q 'UP' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 25
+      start_period: 15s

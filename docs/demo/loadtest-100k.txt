@@ -1,0 +1,235 @@
+$ java -Djdk.httpclient.keepalive.timeout=60 -jar load-generator/target/load-generator-0.1.0-SNAPSHOT-shaded.jar --bookings=100000 --duplicates=0.05 --poison=0.01 --seed=20261124 --threads=32 --warmup-seconds=5 --base-url=http://127.0.0.1:8085
+[main] INFO org.apache.kafka.clients.producer.ProducerConfig - ProducerConfig values: 
+	acks = -1
+	auto.include.jmx.reporter = true
+	batch.size = 16384
+	bootstrap.servers = [127.0.0.1:9092]
+	buffer.memory = 33554432
+	client.dns.lookup = use_all_dns_ips
+	client.id = producer-1
+	compression.gzip.level = -1
+	compression.lz4.level = 9
+	compression.type = none
+	compression.zstd.level = 3
+	connections.max.idle.ms = 540000
+	delivery.timeout.ms = 120000
+	enable.idempotence = true
+	enable.metrics.push = true
+	interceptor.classes = []
+	key.serializer = class org.apache.kafka.common.serialization.StringSerializer
+	linger.ms = 5
+	max.block.ms = 60000
+	max.in.flight.requests.per.connection = 5
+	max.request.size = 1048576
+	metadata.max.age.ms = 300000
+	metadata.max.idle.ms = 300000
+	metadata.recovery.strategy = none
+	metric.reporters = []
+	metrics.num.samples = 2
+	metrics.recording.level = INFO
+	metrics.sample.window.ms = 30000
+	partitioner.adaptive.partitioning.enable = true
+	partitioner.availability.timeout.ms = 0
+	partitioner.class = null
+	partitioner.ignore.keys = false
+	receive.buffer.bytes = 32768
+	reconnect.backoff.max.ms = 1000
+	reconnect.backoff.ms = 50
+	request.timeout.ms = 30000
+	retries = 2147483647
+	retry.backoff.max.ms = 1000
+	retry.backoff.ms = 100
+	sasl.client.callback.handler.class = null
+	sasl.jaas.config = null
+	sasl.kerberos.kinit.cmd = /usr/bin/kinit
+	sasl.kerberos.min.time.before.relogin = 60000
+	sasl.kerberos.service.name = null
+	sasl.kerberos.ticket.renew.jitter = 0.05
+	sasl.kerberos.ticket.renew.window.factor = 0.8
+	sasl.login.callback.handler.class = null
+	sasl.login.class = null
+	sasl.login.connect.timeout.ms = null
+	sasl.login.read.timeout.ms = null
+	sasl.login.refresh.buffer.seconds = 300
+	sasl.login.refresh.min.period.seconds = 60
+	sasl.login.refresh.window.factor = 0.8
+	sasl.login.refresh.window.jitter = 0.05
+	sasl.login.retry.backoff.max.ms = 10000
+	sasl.login.retry.backoff.ms = 100
+	sasl.mechanism = GSSAPI
+	sasl.oauthbearer.clock.skew.seconds = 30
+	sasl.oauthbearer.expected.audience = null
+	sasl.oauthbearer.expected.issuer = null
+	sasl.oauthbearer.header.urlencode = false
+	sasl.oauthbearer.jwks.endpoint.refresh.ms = 3600000
+	sasl.oauthbearer.jwks.endpoint.retry.backoff.max.ms = 10000
+	sasl.oauthbearer.jwks.endpoint.retry.backoff.ms = 100
+	sasl.oauthbearer.jwks.endpoint.url = null
+	sasl.oauthbearer.scope.claim.name = scope
+	sasl.oauthbearer.sub.claim.name = sub
+	sasl.oauthbearer.token.endpoint.url = null
+	security.protocol = PLAINTEXT
+	security.providers = null
+	send.buffer.bytes = 131072
+	socket.connection.setup.timeout.max.ms = 30000
+	socket.connection.setup.timeout.ms = 10000
+	ssl.cipher.suites = null
+	ssl.enabled.protocols = [TLSv1.2, TLSv1.3]
+	ssl.endpoint.identification.algorithm = https
+	ssl.engine.factory.class = null
+	ssl.key.password = null
+	ssl.keymanager.algorithm = SunX509
+	ssl.keystore.certificate.chain = null
+	ssl.keystore.key = null
+	ssl.keystore.location = null
+	ssl.keystore.password = null
+	ssl.keystore.type = JKS
+	ssl.protocol = TLSv1.3
+	ssl.provider = null
+	ssl.secure.random.implementation = null
+	ssl.trustmanager.algorithm = PKIX
+	ssl.truststore.certificates = null
+	ssl.truststore.location = null
+	ssl.truststore.password = null
+	ssl.truststore.type = JKS
+	transaction.timeout.ms = 60000
+	transactional.id = null
+	value.serializer = class io.confluent.kafka.serializers.KafkaAvroSerializer
+
+[main] INFO org.apache.kafka.common.telemetry.internals.KafkaMetricsCollector - initializing Kafka metrics collector
+[main] INFO io.confluent.kafka.serializers.KafkaAvroSerializerConfig - KafkaAvroSerializerConfig values: 
+	auto.register.schemas = true
+	avro.reflection.allow.null = false
+	avro.remove.java.properties = false
+	avro.use.logical.type.converters = false
+	basic.auth.credentials.source = URL
+	basic.auth.user.info = [hidden]
+	bearer.auth.cache.expiry.buffer.seconds = 300
+	bearer.auth.client.id = null
+	bearer.auth.client.secret = null
+	bearer.auth.credentials.source = STATIC_TOKEN
+	bearer.auth.custom.provider.class = null
+	bearer.auth.identity.pool.id = null
+	bearer.auth.issuer.endpoint.url = null
+	bearer.auth.logical.cluster = null
+	bearer.auth.scope = null
+	bearer.auth.scope.claim.name = scope
+	bearer.auth.sub.claim.name = sub
+	bearer.auth.token = [hidden]
+	context.name.strategy = class io.confluent.kafka.serializers.context.NullContextNameStrategy
+	http.connect.timeout.ms = 60000
+	http.read.timeout.ms = 60000
+	id.compatibility.strict = true
+	key.subject.name.strategy = class io.confluent.kafka.serializers.subject.TopicNameStrategy
+	latest.cache.size = 1000
+	latest.cache.ttl.sec = -1
+	latest.compatibility.strict = true
+	max.retries = 3
+	max.schemas.per.subject = 1000
+	normalize.schemas = false
+	propagate.schema.tags = false
+	proxy.host = 
+	proxy.port = -1
+	retries.max.wait.ms = 20000
+	retries.wait.ms = 1000
+	rule.actions = []
+	rule.executors = []
+	rule.service.loader.enable = true
+	schema.format = null
+	schema.reflection = false
+	schema.registry.basic.auth.user.info = [hidden]
+	schema.registry.ssl.cipher.suites = null
+	schema.registry.ssl.enabled.protocols = [TLSv1.2, TLSv1.3]
+	schema.registry.ssl.endpoint.identification.algorithm = https
+	schema.registry.ssl.engine.factory.class = null
+	schema.registry.ssl.key.password = null
+	schema.registry.ssl.keymanager.algorithm = SunX509
+	schema.registry.ssl.keystore.certificate.chain = null
+	schema.registry.ssl.keystore.key = null
+	schema.registry.ssl.keystore.location = null
+	schema.registry.ssl.keystore.password = null
+	schema.registry.ssl.keystore.type = JKS
+	schema.registry.ssl.protocol = TLSv1.3
+	schema.registry.ssl.provider = null
+	schema.registry.ssl.secure.random.implementation = null
+	schema.registry.ssl.trustmanager.algorithm = PKIX
+	schema.registry.ssl.truststore.certificates = null
+	schema.registry.ssl.truststore.location = null
+	schema.registry.ssl.truststore.password = null
+	schema.registry.ssl.truststore.type = JKS
+	schema.registry.url = [http://127.0.0.1:8081]
+	schema.registry.url.randomize = false
+	use.latest.version = false
+	use.latest.with.metadata = null
+	use.schema.id = -1
+	value.subject.name.strategy = class io.confluent.kafka.serializers.subject.TopicNameStrategy
+
+[main] INFO org.apache.kafka.clients.producer.KafkaProducer - [Producer clientId=producer-1] Instantiated an idempotent producer.
+[main] INFO org.apache.kafka.clients.producer.ProducerConfig - These configurations '[schema.registry.url]' were supplied but are not used yet.
+[main] INFO org.apache.kafka.common.utils.AppInfoParser - Kafka version: 3.9.2
+[main] INFO org.apache.kafka.common.utils.AppInfoParser - Kafka commitId: 5e9866f43ab8e7e4
+[main] INFO org.apache.kafka.common.utils.AppInfoParser - Kafka startTimeMs: 1795594883856
+[setup] Creating 128 benchmark accounts and 16 warmup accounts (seed=20261124)...
+[kafka-producer-network-thread | producer-1] INFO org.apache.kafka.clients.Metadata - [Producer clientId=producer-1] Cluster ID: MkU3OEVBNTcwNTJENDM2Qk
+[kafka-producer-network-thread | producer-1] INFO org.apache.kafka.clients.producer.internals.TransactionManager - [Producer clientId=producer-1] ProducerId set to 1 with epoch 0
+[warmup] Completed 5s warmup: 885 warmup bookings accepted (excluded from stats).
+[run] Starting measured load: regular=100000 duplicates=5000 (5.0%) poison=1000 (1.0%) threads=32 seed=20261124
+WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper (file:/home/tim/projects/privat/kafka/load-generator/target/load-generator-0.1.0-SNAPSHOT-shaded.jar)
+WARNING: Please consider reporting this to the maintainers of class com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper
+WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
+[progress] regular=10000/100000 duplicates=480 poison=96 rejected=0
+[progress] regular=20000/100000 duplicates=982 poison=192 rejected=0
+[progress] regular=30000/100000 duplicates=1483 poison=288 rejected=0
+[progress] regular=40000/100000 duplicates=1987 poison=384 rejected=0
+[progress] regular=50000/100000 duplicates=2484 poison=483 rejected=0
+[progress] regular=60000/100000 duplicates=2982 poison=583 rejected=0
+[progress] regular=70000/100000 duplicates=3483 poison=680 rejected=0
+[progress] regular=80000/100000 duplicates=3983 poison=778 rejected=0
+[progress] regular=100000/100000 duplicates=4999 poison=999 rejected=0
+[run] Finished in 264.30s: regular=100000/100000 dupReplayed=5000/5000 (mismatch=0) rejected=0 httpErr=0 poison=1000
+[main] INFO org.apache.kafka.clients.producer.KafkaProducer - [Producer clientId=producer-1] Closing the Kafka producer with timeoutMillis = 9223372036854775807 ms.
+[main] INFO org.apache.kafka.common.metrics.Metrics - Metrics scheduler closed
+[main] INFO org.apache.kafka.common.metrics.Metrics - Closing reporter org.apache.kafka.common.metrics.JmxReporter
+[main] INFO org.apache.kafka.common.metrics.Metrics - Closing reporter org.apache.kafka.common.telemetry.internals.ClientTelemetryReporter
+[main] INFO org.apache.kafka.common.metrics.Metrics - Metrics reporters closed
+[main] INFO org.apache.kafka.common.utils.AppInfoParser - App info kafka.producer for producer-1 unregistered
+[drain] Waiting for outbox_unsent=0, processed_events=100885, dlq_entries=1000 (timeout=900s)...
+
+============================================================
+LEDGER-STREAM PHASE 10 LOAD REPORT
+============================================================
+Seed: 20261124 | Threads: 32 | Accounts: 128 | Warmup: 5s (885 bookings excluded)
+Cohort 1 (Regular HTTP):    sent=100000 accepted=100000 rejected=0 httpErrors=0
+Cohort 2 (Duplicates L2):   sent=5000 replayed_201_header_match=5000 mismatches=0
+Cohort 3 (Poison Avro):     sent=1000 (unknown_account=500, non_positive_amount=500)
+Duration (excl. warmup):    264.30 s
+Client throughput:          sent=397.3 HTTP req/s | accepted=378.4 bookings/s
+Client latency (regular):   p50=70.65 ms | p95=165.35 ms | p99=246.05 ms | max=543.59 ms
+Client latency (all HTTP):  p50=69.35 ms | p95=163.49 ms | p99=243.88 ms | max=543.59 ms
+POST_LOAD_SERVER_METRICS: http_p50=51.14ms http_p95=130.85ms http_p99=204.22ms http_rate=353.4/s consumer_rate=92.8/s consumer_processed=28118 consumer_dup_rejected=0 consumer_poison=272 dlq_unhandled=272 outbox_unsent=0
+------------------------------------------------------------
+AUTOMATED INVARIANT CHECK (Exit code 0 iff all PASS)
+------------------------------------------------------------
+Max outbox_unsent (live):   2221 | Drain time: 140.86 s (outbox_unsent remaining=0)
+[PASS] Benchmark DB bookings: 100000 == expected 100000 (diff=0)
+[PASS] Total DB bookings:     100885 == expected 100885 (incl. warmup=885, diff=0)
+[PASS] Rejected HTTP reqs:    validation=0 httpErrors=0 dupMismatch=0 (expected 0)
+[PASS] DLQ unhandled entries: 1000 == poison sent 1000 (diff=0)
+[PASS] Processed events (DB): 100885 == expected 100885 (diff=0)
+[PASS] L2 consumer_duplicates_rejected_total{reason="duplicate"}: 0 == 0
+Account balance exact sample (10 benchmark accounts):
+  [PASS] DE-BENCH-1352904-0000 | account.balance=11737.39 | sum(bookings)=11737.39 | summary.balance=11737.39 | count=782/782
+  [PASS] DE-BENCH-1352904-0001 | account.balance=12307.11 | sum(bookings)=12307.11 | summary.balance=12307.11 | count=782/782
+  [PASS] DE-BENCH-1352904-0002 | account.balance=11276.23 | sum(bookings)=11276.23 | summary.balance=11276.23 | count=782/782
+  [PASS] DE-BENCH-1352904-0003 | account.balance=11088.68 | sum(bookings)=11088.68 | summary.balance=11088.68 | count=782/782
+  [PASS] DE-BENCH-1352904-0004 | account.balance=14257.41 | sum(bookings)=14257.41 | summary.balance=14257.41 | count=782/782
+  [PASS] DE-BENCH-1352904-0005 | account.balance=12449.54 | sum(bookings)=12449.54 | summary.balance=12449.54 | count=782/782
+  [PASS] DE-BENCH-1352904-0006 | account.balance=11456.03 | sum(bookings)=11456.03 | summary.balance=11456.03 | count=782/782
+  [PASS] DE-BENCH-1352904-0007 | account.balance=12405.73 | sum(bookings)=12405.73 | summary.balance=12405.73 | count=782/782
+  [PASS] DE-BENCH-1352904-0008 | account.balance=9210.05 | sum(bookings)=9210.05 | summary.balance=9210.05 | count=782/782
+  [PASS] DE-BENCH-1352904-0009 | account.balance=12112.79 | sum(bookings)=12112.79 | summary.balance=12112.79 | count=782/782
+------------------------------------------------------------
+INVARIANT_CHECK_RESULT=PASS (EXIT_CODE=0)
+============================================================
+POST_DRAIN_SERVER_METRICS: http_p50=48.44ms http_p95=125.23ms http_p99=201.90ms http_rate=221.0/s consumer_rate=308.4/s consumer_processed=100885 consumer_dup_rejected=0 consumer_poison=1000 dlq_unhandled=1000 outbox_unsent=0
